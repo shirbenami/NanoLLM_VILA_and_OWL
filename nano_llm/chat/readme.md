@@ -122,6 +122,43 @@ python3 -m nano_llm.chat \
 
 ## 💡 Example Workflow
 
+---
+
+## ⚠️ Important Setup Notes
+
+### 1. NVMe data storage (optional but recommended)
+If your data is stored on an external NVMe drive, you can move the Jetson container data there and create a symbolic link:
+```bash
+sudo rsync -aHAX --info=progress2 /home/user/jetson-containers/data/ /mnt/VLM/jetson-data/
+sudo rm -rf /home/user/jetson-containers/data
+ln -s /mnt/VLM/jetson-data /home/user/jetson-containers/data
+```
+This ensures that large model files and datasets are stored on the NVMe drive for faster I/O.
+
+### 2. Custom container with model timing
+The main edits for measuring model performance time were done on the **CUSTOM** container, specifically inside:
+```
+/opt/NanoLLM/nano_llm/chat/__main__.py
+```
+This version includes detailed timing logs for model inference speed.
+
+### 3. Enabling GPU graphics acceleration inside Docker
+Before running scripts that use camera or visualization features, you must install and configure the necessary GStreamer and Avahi packages **inside the container**.
+
+Instead of running the script directly, open a bash session first:
+```bash
+jetson-containers run -it $(autotag nano_llm) /bin/bash
+```
+Then inside the container, run:
+```bash
+apt update
+apt install -y gstreamer1.0-nice
+apt-get install -y avahi-utils libnss-mdns
+service avahi-daemon stop
+```
+After performing these steps, you can **commit** and **save** the Docker image to preserve the setup and re-run it later with full graphics support.
+
+
 1. Launch container:
    ```bash
    jetson-containers run nano_llm_custom /bin/bash
@@ -140,4 +177,3 @@ python3 -m nano_llm.chat \
 ## 🧾 License
 
 This project follows the NanoLLM repository license terms. See the original NanoLLM repo for details.
-
