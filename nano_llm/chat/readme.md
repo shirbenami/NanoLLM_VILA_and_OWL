@@ -143,6 +143,10 @@ curl -X POST http://172.16.17.12:8080/describe \
   -d '{"image_path": "/data/images/01.jpg", "question": "what is the color of the drone"}'
 ```
 
+# Reset the in-memory state:
+```
+curl -X POST http://<JETSON_IP>:8080/reset
+```
 ---
 
 ## 📦 Folder Summary
