@@ -130,20 +130,20 @@ The server will start and listen on: http://<JETSON_IP>:8080
 ```
 curl http://172.16.17.12:8080/health
 ```
-# Describe image
+#### Describe image
 ```
 curl -X POST http://172.16.17.12:8080/describe \
   -H "Content-Type: application/json" \
   -d '{"image_path": "/data/images/01.jpg"}'
 ```
-# Ask a follow-up question
+#### Ask a follow-up question
 ```
 curl -X POST http://172.16.17.12:8080/describe \
   -H "Content-Type: application/json" \
   -d '{"image_path": "/data/images/01.jpg", "question": "what is the color of the drone"}'
 ```
 
-# Reset the in-memory state:
+#### Reset the in-memory state:
 ```
 curl -X POST http://<JETSON_IP>:8080/reset
 ```
