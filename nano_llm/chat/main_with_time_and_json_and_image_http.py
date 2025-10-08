@@ -11,11 +11,6 @@ Additions:
 - After writing the per-image JSON, the document is forwarded via HTTP POST
   to a remote receiver (default: http://172.16.17.11:5000/ingest),
   configurable with --forward-url.
-
-Notes:
-- English-only comments and messages (as requested).
-- The same "single run cycle" logic (process_user_prompt) is reused for both
-  CLI and API.
 """
 
 import os
