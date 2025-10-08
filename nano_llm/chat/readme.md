@@ -126,7 +126,7 @@ python3 main_with_time_and_json_http.py \
 The server will start and listen on: http://<JETSON_IP>:8080
 
 **Test Commands::**
-# Run health check
+#### Run health check
 ```
 curl http://172.16.17.12:8080/health
 ```
