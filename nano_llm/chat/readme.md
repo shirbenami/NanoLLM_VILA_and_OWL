@@ -102,6 +102,47 @@ python3 -m nano_llm.chat \
 - `--min-objects` → Minimum expected object count before retry (default: 3)
 - `--max-rounds` → Max retry attempts to request more objects (default: 2)
 
+
+### 4. `main_with_time_and_json_http.py`
+**Purpose:** Run the VILA model as an HTTP API server that receives image paths from external clients, generates a textual description for each image, and saves the results to a JSON file per image.
+
+```bash
+jetson-containers run -it \
+  --publish 8080:8080 \
+  --volume /home/user/jetson-containers/data:/mnt/VLM/jetson-data \
+  nano_llm_custom /bin/bash
+```
+🧠 Note:
+jetson-containers automatically mounts /home/user/jetson-containers/data to /data inside the container.
+The extra --volume mount ensures that symbolic links resolving to /mnt/VLM/jetson-data are also accessible inside the container (important when using NVMe storage).
+
+**Run example:**
+```bash
+python3 main_with_time_and_json_http.py \
+  --model Efficient-Large-Model/VILA1.5-3b \
+  --save-json-by-image \
+  --server --port 8080
+```
+The server will start and listen on: http://<JETSON_IP>:8080
+
+**Test Commands::**
+# Run health check
+```
+curl http://172.16.17.12:8080/health
+```
+# Describe image
+```
+curl -X POST http://172.16.17.12:8080/describe \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/data/images/01.jpg"}'
+```
+# Ask a follow-up question
+```
+curl -X POST http://172.16.17.12:8080/describe \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/data/images/01.jpg", "question": "what is the color of the drone"}'
+```
+
 ---
 
 ## 📦 Folder Summary
