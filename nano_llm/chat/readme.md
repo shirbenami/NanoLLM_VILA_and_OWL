@@ -103,9 +103,11 @@ python3 -m nano_llm.chat \
 - `--max-rounds` → Max retry attempts to request more objects (default: 2)
 
 
-### 4. `main_with_time_and_json_http.py`
-**Purpose:** Run the VILA model as an HTTP API server that receives image paths from external clients, generates a textual description for each image, and saves the results to a JSON file per image.
+### 4. `main_with_time_and_json_and_image_http.py`
+**Purpose:** Run the VILA model as an HTTP API server that receives image paths from external clients, generates a textual description for each image, , saves the results to a per-image JSON locally, and forwards both the JSON and the source image to a remote collector over HTTP (default: http://172.16.17.11:5000/ingest).
+On the collector, the files are saved under ./ingested as <basename>.json and <basename>.jpg (or the original image extension if not JPG)
 
+**Container:**
 ```bash
 jetson-containers run -it \
   --publish 8080:8080 \
@@ -115,6 +117,16 @@ jetson-containers run -it \
 🧠 Note:
 jetson-containers automatically mounts /home/user/jetson-containers/data to /data inside the container.
 The extra --volume mount ensures that symbolic links resolving to /mnt/VLM/jetson-data are also accessible inside the container (important when using NVMe storage).
+
+**Receiver(remote collector) — on 172.16.17.11**
+Run the small Flask service that accepts the JSON + image and writes them to ./ingested:
+```bash
+# on 172.16.17.11
+python3 -m venv venv && source venv/bin/activate
+pip install flask
+python receiver_from_vila_with_image.py
+# listening on http://0.0.0.0:5000/ingest
+```
 
 **Run example:**
 ```bash
@@ -143,10 +155,7 @@ curl -X POST http://172.16.17.12:8080/describe \
   -d '{"image_path": "/data/images/01.jpg", "question": "what is the color of the drone"}'
 ```
 
-#### Reset the in-memory state:
-```
-curl -X POST http://<JETSON_IP>:8080/reset
-```
+
 ---
 
 ## 📦 Folder Summary
