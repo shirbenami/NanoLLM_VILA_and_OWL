@@ -20,7 +20,7 @@ This creates a full real-time pipeline from **camera capture** → **VLM descrip
 
 
 
-### 1. `main_with_time_and_json_and_image_http.py`
+### 1. main_with_time_and_json_and_image_http.py
 
 **Purpose:**
 This script runs the **VILA model** as an HTTP API server that receives image paths from external clients, generates a textual description for each image, saves the results to a per-image JSON locally, and forwards both the JSON and the source image to a remote collector over HTTP (default: `http://172.16.17.11:5000/ingest`).
@@ -96,7 +96,7 @@ curl -X POST http://172.16.17.12:8080/describe \
 
 ---
 
-### 2. `capture_frames.py`
+### 2. capture_frames.py
 
 **Purpose:**
 This script captures frames from a **live video stream** (e.g., `/dev/video0`, RTSP, or file) and saves images every few seconds or based on a predefined set of **poses** listed in `/opt/missions/poses.json`.
@@ -170,7 +170,7 @@ The captured images and metadata are automatically saved, including optional VLM
 
 ---
 
-### 3. **Receiver (Remote Collector on 172.16.17.11)**
+### 3. Receiver (Remote Collector on 172.16.17.11)
 
 Run a lightweight Flask service that receives the JSON + image files from the Jetson device and saves them locally:
 
