@@ -1,4 +1,4 @@
-### 🧩 **System Overview**
+## **System Overview**
 
 ```
 📷 Camera / Stream (/dev/video0)
@@ -20,7 +20,7 @@ This creates a full real-time pipeline from **camera capture** → **VLM descrip
 
 
 
-### `main_with_time_and_json_and_image_http.py`
+### 1. `main_with_time_and_json_and_image_http.py`
 
 **Purpose:**
 This script runs the **VILA model** as an HTTP API server that receives image paths from external clients, generates a textual description for each image, saves the results to a per-image JSON locally, and forwards both the JSON and the source image to a remote collector over HTTP (default: `http://172.16.17.11:5000/ingest`).
@@ -28,7 +28,7 @@ On the collector side, the files are saved under `./ingested` as `<basename>.jso
 
 ---
 
-### 🧱 **Container Setup (Jetson)**
+#### **Container Setup (Jetson)**
 
 Run the container that hosts the VILA model:
 
@@ -48,7 +48,7 @@ The extra `--volume` mount ensures that symbolic links resolving to `/mnt/VLM/je
 
 ---
 
-### 🚀 **Running the VILA Server**
+#### 🚀 **Running the VILA Server**
 
 Start the HTTP server that exposes the model API:
 
@@ -70,15 +70,15 @@ http://<JETSON_IP>:8080
 
 ---
 
-### 🧪 **Testing the API**
+#### **Testing the API**
 
-#### ✅ Health Check
+##### Health Check
 
 ```bash
 curl http://172.16.17.12:8080/health
 ```
 
-#### 🖼️ Describe an Image
+##### Describe an Image
 
 ```bash
 curl -X POST http://172.16.17.12:8080/describe \
@@ -86,7 +86,7 @@ curl -X POST http://172.16.17.12:8080/describe \
   -d '{"image_path": "/data/images/01.jpg"}'
 ```
 
-#### 💬 Ask a Follow-up Question
+##### 💬 Ask a Follow-up Question
 
 ```bash
 curl -X POST http://172.16.17.12:8080/describe \
@@ -96,7 +96,7 @@ curl -X POST http://172.16.17.12:8080/describe \
 
 ---
 
-### `capture_frames.py`
+### 2. `capture_frames.py`
 
 **Purpose:**
 This script captures frames from a **live video stream** (e.g., `/dev/video0`, RTSP, or file) and saves images every few seconds or based on a predefined set of **poses** listed in `/opt/missions/poses.json`.
@@ -105,7 +105,7 @@ The script can automatically call the VLM HTTP endpoint (e.g., `http://172.16.17
 
 ---
 
-### 🧩 **Pose File Example**
+#### **Pose File Example**
 
 ```json
 [
@@ -116,12 +116,12 @@ The script can automatically call the VLM HTTP endpoint (e.g., `http://172.16.17
 ]
 ```
 
-Each entry defines a position (`x`, `y`, `z`) and orientation (`yaw` in radians).
+Each entry defines a position (`x`, `y`, `z`) and orientation (`yaw` in radians).       └── ./ingested/  ←  JSON + Images stored here
 The script iterates through these poses, capturing one image per pose, and saves the data accordingly.
 
 ---
 
-### 🧠 **How to Run**
+#### **How to Run**
 
 Run the script from inside the images directory:
 
@@ -139,7 +139,7 @@ This will:
 
 ---
 
-### 📂 **Output Structure**
+#### **Output Structure**
 
 ```
 captures/
@@ -155,7 +155,7 @@ Each pair of `.jpg` and `.json` files contains an image and its corresponding me
 
 ---
 
-### 🎮 **Interactive Mode (Manual Capture)**
+#### 🎮 **Interactive Mode (Manual Capture)**
 
 ```bash
 python3 capture_frames.py --source /dev/video0 --interactive --preview --vlm http://172.16.17.12:8080/describe
@@ -170,7 +170,7 @@ The captured images and metadata are automatically saved, including optional VLM
 
 ---
 
-### 🖥️ **Receiver (Remote Collector on 172.16.17.11)**
+### 3. **Receiver (Remote Collector on 172.16.17.11)**
 
 Run a lightweight Flask service that receives the JSON + image files from the Jetson device and saves them locally:
 
