@@ -130,10 +130,7 @@ python receiver_from_vila_with_image.py
 
 **Run example:**
 ```bash
-python3 main_with_time_and_json_http.py \
-  --model Efficient-Large-Model/VILA1.5-3b \
-  --save-json-by-image \
-  --server --port 8080
+python3 -m nano_llm.chat   --api=mlc   --model Efficient-Large-Model/VILA1.5-3b   --max-context-len 256   --max-new-tokens 32   --save-json-by-image --server --port 8080
 ```
 The server will start and listen on: http://<JETSON_IP>:8080
 
