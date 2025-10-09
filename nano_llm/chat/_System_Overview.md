@@ -96,7 +96,7 @@ curl -X POST http://172.16.17.12:8080/describe \
 
 ---
 
-### 5. `capture_frames.py`
+### `capture_frames.py`
 
 **Purpose:**
 This script captures frames from a **live video stream** (e.g., `/dev/video0`, RTSP, or file) and saves images every few seconds or based on a predefined set of **poses** listed in `/opt/missions/poses.json`.
