@@ -1,3 +1,25 @@
+### 🧩 **System Overview**
+
+```
+📷 Camera / Stream (/dev/video0)
+       │
+       ▼
+🧩 capture_frames.py → /opt/missions/poses.json
+       │
+       │ Sends image_path requests to
+       ▼
+🌐 main_with_time_and_json_and_image_http.py (VILA API Server)
+       │
+       │ Forwards results to
+       ▼
+🖥️ receiver_from_vila_with_image.py (Collector)
+       └── ./ingested/  ←  JSON + Images stored here
+```
+
+This creates a full real-time pipeline from **camera capture** → **VLM description** → **remote collection**, ready for robotics, AI perception, or dataset generation workflows.
+
+
+
 ### `main_with_time_and_json_and_image_http.py`
 
 **Purpose:**
@@ -23,19 +45,6 @@ The extra `--volume` mount ensures that symbolic links resolving to `/mnt/VLM/je
 
 ---
 
-### 🖥️ **Receiver (Remote Collector on 172.16.17.11)**
-
-Run a lightweight Flask service that receives the JSON + image files from the Jetson device and saves them locally:
-
-```bash
-# on 172.16.17.11
-python3 -m venv venv && source venv/bin/activate
-pip install flask
-python receiver_from_vila_with_image.py
-# The service listens on http://0.0.0.0:5000/ingest
-```
-
-Every new image and its description JSON will appear in the local `./ingested` folder.
 
 ---
 
@@ -161,22 +170,19 @@ The captured images and metadata are automatically saved, including optional VLM
 
 ---
 
-### 🧩 **System Overview**
+### 🖥️ **Receiver (Remote Collector on 172.16.17.11)**
 
-```
-📷 Camera / Stream (/dev/video0)
-       │
-       ▼
-🧩 capture_frames.py → /opt/missions/poses.json
-       │
-       │ Sends image_path requests to
-       ▼
-🌐 main_with_time_and_json_and_image_http.py (VILA API Server)
-       │
-       │ Forwards results to
-       ▼
-🖥️ receiver_from_vila_with_image.py (Collector)
-       └── ./ingested/  ←  JSON + Images stored here
+Run a lightweight Flask service that receives the JSON + image files from the Jetson device and saves them locally:
+
+```bash
+# on 172.16.17.11
+python3 -m venv venv && source venv/bin/activate
+pip install flask
+python receiver_from_vila_with_image.py
+# The service listens on http://0.0.0.0:5000/ingest
 ```
 
-This creates a full real-time pipeline from **camera capture** → **VLM description** → **remote collection**, ready for robotics, AI perception, or dataset generation workflows.
+Every new image and its description JSON will appear in the local `./ingested` folder.
+
+
+
