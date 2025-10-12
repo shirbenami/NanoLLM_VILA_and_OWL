@@ -176,7 +176,59 @@ The captured images and metadata are automatically saved, including optional VLM
 
 ---
 
-### 3. Receiver (Remote Collector on 172.16.17.11)
+### 3. Display Server (Web GUI Viewer)
+
+**Purpose:**
+The Display Server provides a real-time graphical interface (GUI) to view all collected images and their textual descriptions.
+It scans the captures/ or ingested/ directories, displays each image as a thumbnail, and shows the description text extracted from the corresponding JSON file.
+This helps to monitor VILA outputs, verify capture quality, and inspect dataset generation visually.
+
+**How It Works:**
+
+```bash
+📁 ./captures/<timestamp>/
+   ├── image_01.jpg
+   ├── image_01.json  ← contains VILA caption
+   ├── image_02.jpg
+   ├── image_02.json
+   └── ...
+
+🌐 display_server.py
+   └── launches a local web server (Flask) to visualize all image–JSON pairs
+```
+The server automatically scans all sub-folders under the root directory you provide (--root) and refreshes the grid every few seconds.
+
+**Installation:**
+```bash
+pip install flask
+```
+
+**Running the Display Server**
+```bash
+python3 display_server.py \
+  --root /home/user/jetson-containers/data/images/captures \
+  --host 0.0.0.0 \
+  --port 8090
+```
+Adjust the --root path if your captures are stored elsewhere
+(e.g. /home/user/ingested for the remote collector machine).
+
+**Accessing the Web Interface**
+Open your browser and navigate to:
+```bash
+http://<DEVICE_IP>:8090
+```
+Example:
+
+```bash
+http://172.16.17.12:8090
+```
+
+You’ll see a dark-themed dashboard with all your recent captures displayed in a responsive grid view.
+The interface auto-refreshes every 2 seconds — you can also press “Refresh now” at the top-right corner to reload manually.
+
+
+### 4. Receiver (Remote Collector on 172.16.17.11)
 
 Run a lightweight Flask service that receives the JSON + image files from the Jetson device and saves them locally:
 
