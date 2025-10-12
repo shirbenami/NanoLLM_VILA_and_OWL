@@ -8,7 +8,7 @@
        │
        │ Sends image_path requests to
        ▼
-🌐 main_with_time_and_json_and_image_http.py (VILA API Server)
+🌐 main_with_time_and_json_and_image_http.py (VILA API Server) (run the main from : /opt/NanoLLM/nano_llm/chat/__main__.py)
        │
        │ Visualized by
        ▼
