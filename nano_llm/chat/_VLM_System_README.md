@@ -163,6 +163,11 @@ Each pair of `.jpg` and `.json` files contains an image and its corresponding me
 
 #### 🎮 **Interactive Mode (Manual Capture)**
 
+in folder  
+```bash
+/home/user/jetson-containers/data/images
+```
+
 ```bash
 python3 capture_frames.py --source /dev/video0 --interactive --preview --vlm http://172.16.17.12:8080/describe
 ```
@@ -197,6 +202,11 @@ This helps to monitor VILA outputs, verify capture quality, and inspect dataset 
    └── launches a local web server (Flask) to visualize all image–JSON pairs
 ```
 The server automatically scans all sub-folders under the root directory you provide (--root) and refreshes the grid every few seconds.
+
+in folder:
+```bash
+/home/user/shir
+```
 
 **Installation:**
 ```bash
