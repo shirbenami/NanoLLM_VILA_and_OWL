@@ -10,10 +10,19 @@
        ▼
 🌐 main_with_time_and_json_and_image_http.py (VILA API Server)
        │
-       │ Forwards results to
+       │ Visualized by
+       ▼
+🌈 display_server.py (Web GUI Viewer) (take the files from /home/user/jetson-containers/data/images/captures/)
+       └── http://<DEVICE_IP>:8090  ←  Live dashboard for images + captions
+       │
+       │ Forwards results to 
        ▼
 🖥️ receiver_from_vila_with_image.py (Collector)
        └── ./ingested/  ←  JSON + Images stored here
+       │
+       │ Stores files under
+       ▼
+📂 ./ingested/  ←  JSON + Images stored here
 ```
 
 This creates a full real-time pipeline from **camera capture** → **VLM description** → **remote collection**, ready for robotics, AI perception, or dataset generation workflows.
