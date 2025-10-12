@@ -197,7 +197,7 @@ The Display Server provides a real-time graphical interface (GUI) to view all co
 It scans the captures/ or ingested/ directories, displays each image as a thumbnail, and shows the description text extracted from the corresponding JSON file.
 This helps to monitor VILA outputs, verify capture quality, and inspect dataset generation visually.
 
-<img width="1599" height="1332" alt="image" src="https://github.com/user-attachments/assets/53908243-802c-48bd-9dea-a2494f401c7f" />
+<img width="1599" height="1332" alt="image" src="https://github.com/user-attachments/assets/845a32fc-269b-4d16-baf7-35474d642771" />
 
 **How It Works:**
 
