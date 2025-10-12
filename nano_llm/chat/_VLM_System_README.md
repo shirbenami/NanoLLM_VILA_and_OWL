@@ -137,6 +137,12 @@ This will:
 3. Capture one frame per pose every few seconds.
 4. Save the images and JSON files (including the VLM-generated captions) under a timestamped folder inside `captures/`.
 
+* if the camera change input you can check
+```bash
+v4l2-ctl --list-devices
+```
+and change to /dev/video1 for example.
+
 ---
 
 #### **Output Structure**
