@@ -1,173 +1,147 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+VILA server/CLI:
+1) CLI mode (interactive prompts as before).
+2) HTTP API server mode (--server) to accept image_path (and optional question),
+   run VILA, and append to a local JSON-by-image file.
+
+Changes for new architecture:
+- Keep per-image JSON *locally* only (no remote forwarding of JSON or images).
+- Optional notify hook: --notify-url (text/plain) sends ONLY the VLM textual output
+  to a local comm-manager endpoint on every generation.
+"""
+
 import os
 import sys
 import time
 import json
-import re
+import signal
 import logging
-import traceback
+import threading
+
+import urllib.request, urllib.error
 from urllib.parse import urlparse
+
 from termcolor import cprint
+import numpy as np
 
-from nano_llm import NanoLLM, ChatHistory, BotFunctions
-from nano_llm.utils import ArgParser, KeyboardInterrupt, load_prompts, print_table
+# NanoLLM stack (assumes your existing environment)
+from nano_llm import NanoLLM, ChatHistory, ChatTemplates, BotFunctions
+from nano_llm.utils import ImageExtensions, ArgParser, KeyboardInterrupt, load_prompts, print_table
 
-# ===================== Helpers =====================
+# ---------------------------
+# Lightweight HTTP client (stdlib)
+# ---------------------------
+import urllib.request
+import urllib.error
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+def _http_post_text(url: str, text: str, timeout: float = 6.0) -> tuple[int, str]:
+    """
+    POST plain text to 'url' as text/plain; utf-8.
+    Returns: (status_code, response_text) or (-1, err) on network errors.
+    """
+    req = urllib.request.Request(
+        url=url,
+        data=(text or "").encode("utf-8"),
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            body = resp.read().decode("utf-8", errors="replace")
+            return status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
+        return e.code, body
+    except Exception as e:
+        return -1, str(e)
 
-def _is_image_path_or_url(text: str) -> bool:
-    if not text:
+# ---------------------------
+# Helpers for JSON by image (local only)
+# ---------------------------
+
+def _ext_of(path: str) -> str:
+    """Return the lowercase extension of a local path or URL."""
+    p = path.strip().strip("'").strip('"')
+    if p.lower().startswith(("http://", "https://")):
+        parsed = urlparse(p)
+        _, ext = os.path.splitext(parsed.path)
+        return ext.lower()
+    _, ext = os.path.splitext(p)
+    return ext.lower()
+
+def _is_image_path_or_url(user_text: str) -> bool:
+    """Detect if the user_text looks like an image path or image URL."""
+    if not user_text:
         return False
-    s = text.strip().strip("'").strip('"')
-    if s.lower().startswith(("http://", "https://")):
-        _, ext = os.path.splitext(urlparse(s).path)
-        return ext.lower() in IMAGE_EXTS
-    _, ext = os.path.splitext(s)
-    return ext.lower() in IMAGE_EXTS and os.path.exists(s)
+    ext = _ext_of(user_text)
+    normalized = {e if e.startswith(".") else f".{e}" for e in (ImageExtensions if isinstance(ImageExtensions, (list, set, tuple)) else [])}
+    if not normalized:
+        # Fallback if ImageExtensions is not provided
+        normalized = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
+    return ext in normalized
 
 def _json_path_for_image(image_path_or_url: str) -> str:
-    s = image_path_or_url.strip().strip("'").strip('"')
-    if s.lower().startswith(("http://", "https://")):
-        base = os.path.basename(urlparse(s).path) or "image"
+    """Return the JSON filename that corresponds to the image (next to it or derived from URL)."""
+    p = image_path_or_url.strip().strip("'").strip('"')
+    if p.lower().startswith(("http://", "https://")):
+        parsed = urlparse(p)
+        base = os.path.basename(parsed.path) or "image"
         name, _ = os.path.splitext(base)
         return f"{name}.json"
-    name, _ = os.path.splitext(s)
+    name, _ = os.path.splitext(p)
     return f"{name}.json"
 
-def _ensure_parent_dir(path: str):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
 
-def _clean_llm_text(t: str) -> str:
-    if t is None:
-        return ""
-    s = str(t).replace("</s>", "").strip()
-    # strip list-numbering at line starts like "1. ", "2) "
-    s = "\n".join(re.sub(r"^\s*\d+[\.\)]\s*", "", ln) for ln in s.splitlines())
-    return s.strip()
-
-def _parse_owl_raw(owl_raw: str):
-    """
-    Expect one line like: [[a drone, a propeller, a floor]]
-    Returns list of items (strings). On failure -> [].
-    """
-    if not owl_raw:
-        return []
-    s = _clean_llm_text(owl_raw)
-    start = s.find("[[")
-    end = s.find("]]", start + 2)
-    if start == -1 or end == -1:
-        return []
-    inner = s[start + 2:end]
-    items = [x.strip() for x in inner.split(",") if x.strip()]
-    return items
-
-def _append_json(json_path, img_path, model, prompt, reply, owl_raw=None, owl_list=None, indent=2):
-    rec = {
-        "timestamp": int(time.time()),
-        "prompt": prompt,
-        "response": reply
-    }
-    if owl_raw is not None:
-        rec["owl_raw"] = owl_raw
-    if owl_list is not None:
-        rec["owl_list"] = owl_list
-
-    data = {}
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-
-    if "entries" not in data or not isinstance(data.get("entries"), list):
-        data = {
-            "image_path": img_path,
-            "model": getattr(model, "repo_id", None) or getattr(model, "name", None),
-            "api": getattr(model, "api", None),
-            "entries": []
-        }
-
-    data["entries"].append(rec)
-    _ensure_parent_dir(json_path)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=(None if indent == 0 else indent))
-    cprint(f"[saved] {json_path}", "cyan")
-
-def _run_one_off(model, chat_template, system_prompt, user_text, max_new_tokens=96, temperature=0.0, top_p=1.0):
-    """
-    Run a short, isolated one-off prompt (no pollution to main history).
-    """
-    tmp = ChatHistory(model, chat_template, system_prompt)
-    tmp.append("user", user_text)
-    emb, pos = tmp.embed_chat()
-    out = model.generate(
-        emb,
-        streaming=False,
-        stop_tokens=tmp.template.stop,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p
-    )
-    return out if isinstance(out, str) else str(out)
-
-def _run_owl_from_image(model, chat_template, system_prompt, image_path_or_url: str, owl_template: str):
-    """
-    Build a temporary chat with:
-      user: <image_path_or_url>
-      user: <owl_template>
-    Generate once (non-streaming). Return string.
-    """
-    tmp = ChatHistory(model, chat_template, system_prompt)
-    tmp.append("user", image_path_or_url)     # attach image
-    tmp.append("user", owl_template)          # ask for Nano-OWL list only
-    emb, pos = tmp.embed_chat()
-    out = model.generate(
-        emb,
-        streaming=False,
-        stop_tokens=tmp.template.stop,
-        max_new_tokens=64,
-        temperature=0.0,
-        top_p=1.0
-    )
-    return out if isinstance(out, str) else str(out)
-
-# ===================== OWL Template =====================
-
-OWL_FROM_IMAGE_TEMPLATE = (
-    "find all the object in the image. Use singular nouns (1 word for each object). write a list of all the object"
-)
-
-# ===================== Args =====================
+# ---------------------------
+# Arguments
+# ---------------------------
 
 parser = ArgParser()
 
-# colors & UX
-parser.add_argument("--prompt-color", type=str, default="blue", help="termcolor for prompts")
-parser.add_argument("--reply-color", type=str, default="green", help="termcolor for replies")
+# Colors and features
+parser.add_argument("--prompt-color", type=str, default="blue", help="termcolor name for user prompts")
+parser.add_argument("--reply-color", type=str, default="green", help="termcolor name for model replies")
+parser.add_argument("--enable-tools", action="store_true", help="allow tool/function calls")
 
-# behavior
-parser.add_argument("--enable-tools", action="store_true", help="enable tool-calls post-reply")
-parser.add_argument("--disable-streaming", action="store_true", help="print reply only when done (no token streaming)")
-parser.add_argument("--disable-stats", action="store_true", help="hide performance stats table")
+# Streaming and stats
+parser.add_argument("--disable-automatic-generation", action="store_false", dest="automatic_generation", help="wait for 'generate' command")
+parser.add_argument("--disable-streaming", action="store_true", help="disable token streaming output")
+parser.add_argument("--disable-stats", action="store_true", help="suppress generation performance stats")
 
-# JSON/OWL automation
+# Save JSON by image toggles (local only)
 parser.add_argument("--save-json-by-image", action="store_true",
-                    help="After each reply, save/append JSON bound to the last image path/URL. JSON filename = <image>.json")
-parser.add_argument("--json-indent", type=int, default=2, help="Indentation for JSON (0=minify)")
-parser.add_argument("--owl-from-image", action="store_true",
-                    help="When the input is an image path/URL, run a dedicated one-off to output ONLY Nano-OWL list (no description).")
+                    help="After each bot reply, append JSON bound to the last image path/URL provided in chat. JSON filename is <image_path>.json")
+parser.add_argument("--json-indent", type=int, default=2, help="Indentation for JSON (0 to minify)")
+
+# HTTP server mode
+parser.add_argument("--server", action="store_true",
+                    help="Run as HTTP server that accepts image_path/question and triggers VILA, saving JSON per image like CLI.")
+parser.add_argument("--port", type=int, default=8080, help="Port for --server mode (default: 8080)")
+
+# NEW: notify comm-manager (message-only)
+parser.add_argument(
+    "--notify-url",
+    type=str,
+    default="",
+    help="If set, POST the VLM textual output (text/plain) to this URL after generation (e.g., http://127.0.0.1:5050/from_vila)."
+)
 
 args = parser.parse_args()
-
-# ===================== Setup =====================
 
 prompts = load_prompts(args.prompt)
 interrupt = KeyboardInterrupt()
 tool_response = None
+
+# Track the most recent image the user provided (used for JSON filename)
+last_image_path = None
+
+# ---------------------------
+# Load Model
+# ---------------------------
 
 model = NanoLLM.from_pretrained(
     args.model,
@@ -176,117 +150,112 @@ model = NanoLLM.from_pretrained(
     max_context_len=args.max_context_len,
     vision_api=args.vision_api,
     vision_model=args.vision_model,
-    vision_scaling=args.vision_scaling
+    vision_scaling=args.vision_scaling,
 )
 
-chat = ChatHistory(model, args.chat_template, args.system_prompt)
+# ---------------------------
+# Chat history
+# ---------------------------
 
-last_image = None
-last_input_was_image = False
+chat_history = ChatHistory(model, args.chat_template, args.system_prompt)
 
-# ===================== Main Loop =====================
+# ---------------------------
+# Append (local JSON only)
+# ---------------------------
 
-while True:
-    # input
-    cprint(">> PROMPT: ", args.prompt_color, end="", flush=True)
-    user_prompt = sys.stdin.readline().strip()
+def _append_entry_to_json(
+    json_path: str,
+    image_path_or_url: str,
+    model,
+    prompt_text: str,
+    reply_text: str,
+    indent: int = 2
+):
+    """
+    Append a single {timestamp, prompt, response} record into the per-image JSON file (local only).
+    NOTE: No remote forwarding from here.
+    """
+    record = {
+        "timestamp": int(time.time()),
+        "prompt": prompt_text,
+        "response": reply_text,
+    }
 
-    # exit/reset
-    if user_prompt.lower() in ("quit", "exit", "q"):
-        break
-    if user_prompt.lower() in ("reset", "clear"):
-        logging.info("resetting chat")
-        chat.reset()
-        last_image = None
-        last_input_was_image = False
-        cprint("[info] chat reset.", "cyan")
-        continue
-
-    # classify input
-    last_input_was_image = _is_image_path_or_url(user_prompt)
-    if last_input_was_image:
-        last_image = user_prompt.strip().strip("'").strip('"')
-        cprint(f"[info] detected image: {last_image}", "cyan")
-
-    # always keep transcript coherent: store user's message
-    chat.append("user", user_prompt)
-
-    # ===== Fast-path for image → OWL =====
-    if args.owl_from_image and last_input_was_image:
+    doc = None
+    if os.path.exists(json_path):
         try:
-            owl_out = _run_owl_from_image(
-                model=model,
-                chat_template=args.chat_template,
-                system_prompt=args.system_prompt,
-                image_path_or_url=last_image,
-                owl_template=OWL_FROM_IMAGE_TEMPLATE
-            )
-            reply_text = _clean_llm_text(owl_out)
-            cprint(reply_text, args.reply_color)
-            chat.append("bot", reply_text)  # keep in transcript
+            with open(json_path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            doc = None
 
-            # parse / save JSON
-            owl_raw = reply_text
-            owl_list = _parse_owl_raw(owl_raw)
-            cprint(f"[owl] {owl_raw}", "yellow")
+    if not isinstance(doc, dict):
+        doc = {
+            "image_path": image_path_or_url.strip().strip("'").strip('"'),
+            "model": getattr(model, "repo_id", None) or getattr(model, "name", None),
+            "api": getattr(model, "api", None),
+            "entries": []
+        }
 
-            if args.save_json_by_image and last_image:
-                json_path = _json_path_for_image(last_image)
-                cprint(f"[info] saving json → {json_path}", "cyan")
-                if not last_image.lower().startswith(("http://", "https://")):
-                    _ensure_parent_dir(json_path)
-                _append_json(
-                    json_path=json_path,
-                    img_path=last_image,
-                    model=model,
-                    prompt=user_prompt,
-                    reply=reply_text,
-                    owl_raw=owl_raw,
-                    owl_list=owl_list,
-                    indent=args.json_indent,
-                )
+    doc.setdefault("entries", [])
+    doc["entries"].append(record)
 
-            # optional stats/tools and continue (skip normal generate)
-            if not args.disable_stats:
-                print_table(model.stats)
-                print("")
-            if args.enable_tools:
-                try:
-                    tool_resp = BotFunctions.run(reply_text, template=chat.template)
-                    if tool_resp:
-                        chat.append("tool_response", tool_resp)
-                        cprint(tool_resp, "yellow")
-                except Exception as e:
-                    cprint(f"[warn] tool execution failed: {e}", "red")
+    # Persist locally
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=indent)
 
-            last_input_was_image = False
-            continue
+    cprint(f"[saved] {json_path}", "cyan")
 
-        except Exception as e:
-            cprint(f"[error] OWL one-off failed, falling back to regular generate: {e}", "red")
-            traceback.print_exc()
-            # fall through to normal generate below
 
-    # ===== embed =====
+# ---------------------------
+# Single "run cycle"
+# ---------------------------
+
+_run_lock = threading.Lock()
+
+def process_user_prompt(user_prompt: str, *, generate: bool = True) -> str:
+    """
+    Execute one cycle:
+    - Detect if prompt is an image path/URL and update last_image_path.
+    - Append user prompt.
+    - Optionally embed_chat + generate with the model.
+    - Append bot reply.
+    - Optionally save JSON bound to last_image_path (local).
+    - Optionally notify comm-manager with message-only text.
+    Returns the textual reply produced by the model (or "" if generate=False).
+    """
+    global last_image_path
+
+    # Detect image path/URL
+    if _is_image_path_or_url(user_prompt):
+        last_image_path = user_prompt.strip().strip("'").strip('"')
+
+    # Append user message into chat history
+    chat_history.append("user", user_prompt)
+
+    # If we only want to append (no generation), exit early
+    if not generate:
+        return ""
+
+    # Embed step
     t0 = time.perf_counter()
-    emb, pos = chat.embed_chat(
+    embedding, position = chat_history.embed_chat(
         max_tokens=model.config.max_length - args.max_new_tokens,
         wrap_tokens=args.wrap_tokens,
-        use_cache=model.has_embed and chat.kv_cache,
+        use_cache=model.has_embed and chat_history.kv_cache,
     )
     t1 = time.perf_counter()
     print(f"[TICTOK] embed_chat: {(t1 - t0)*1000:.2f} ms")
 
-    # ===== generate (regular text prompts) =====
+    # Generate step (exception-safe)
     gen_start = time.perf_counter()
-    reply_text = ""
-    if args.disable_streaming:
-        out = model.generate(
-            emb,
-            streaming=False,
-            kv_cache=chat.kv_cache,
-            cache_position=pos,
-            stop_tokens=chat.template.stop,
+    try:
+        reply = model.generate(
+            embedding,
+            streaming=not args.disable_streaming,
+            kv_cache=chat_history.kv_cache,
+            cache_position=position,
+            stop_tokens=chat_history.template.stop,
             max_new_tokens=args.max_new_tokens,
             min_new_tokens=args.min_new_tokens,
             do_sample=args.do_sample,
@@ -294,90 +263,188 @@ while True:
             temperature=args.temperature,
             top_p=args.top_p,
         )
-        reply_text = _clean_llm_text(out if isinstance(out, str) else str(out))
+    except Exception as e:
+        cprint(f"[error] generate() failed: {e}", "red")
+        chat_history.append("bot", f"[error] generation failed: {e}")
+        # notify error as text if needed
+        if args.notify_url:
+            _http_post_text(args.notify_url.strip(), f"[error] generation failed: {e}", timeout=10.0)
+        return f"[error] generation failed: {e}"
+
+    reply_text = ""
+    if args.disable_streaming:
+        # Non-streaming mode: reply is a single string
+        reply_text = reply
         cprint(reply_text, args.reply_color)
         gen_end = time.perf_counter()
         print(f"[TICTOK] generate_total: {(gen_end - gen_start):.3f}s")
     else:
-        first_tok = None
-        tok_count = 0
-        stream = model.generate(
-            emb,
-            streaming=True,
-            kv_cache=chat.kv_cache,
-            cache_position=pos,
-            stop_tokens=chat.template.stop,
-            max_new_tokens=args.max_new_tokens,
-            min_new_tokens=args.min_new_tokens,
-            do_sample=args.do_sample,
-            repetition_penalty=args.repetition_penalty,
-            temperature=args.temperature,
-            top_p=args.top_p,
-        )
-        for tok in stream:
+        # Streaming mode: reply yields tokens
+        first_token_time = None
+        token_count = 0
+        for token in reply:
             now = time.perf_counter()
-            if first_tok is None:
-                first_tok = now
-                print(f"[TICTOK] TTFT: {(first_tok - gen_start)*1000:.2f} ms")
-            s = str(tok)
-            reply_text += s
-            cprint(s, args.reply_color, end="", flush=True)
-            tok_count += 1
+            if first_token_time is None:
+                first_token_time = now
+                print(f"[TICTOK] TTFT: {(first_token_time - gen_start)*1000:.2f} ms")
+            cprint(token, args.reply_color, end="", flush=True)
+            reply_text += token
+            token_count += 1
             if interrupt:
                 try:
-                    stream.stop()
+                    reply.stop()
                 except Exception:
                     pass
                 interrupt.reset()
                 break
+
         gen_end = time.perf_counter()
-        total = gen_end - gen_start
-        if tok_count > 0:
-            tp = tok_count / (gen_end - (first_tok or gen_start))
-            print(f"\n[TICTOK] generate_total: {total:.3f}s | tokens: {tok_count} | throughput: {tp:.2f} tok/s")
+        total_time = gen_end - gen_start
+        if token_count > 0:
+            throughput = token_count / (gen_end - (first_token_time or gen_start))
+            print(f"\n[TICTOK] generate_total: {total_time:.3f}s | tokens: {token_count} | throughput: {throughput:.2f} tok/s")
 
-    print("")  # newline after reply
+    print("")  # newline after generation
 
-    # stats
     if not args.disable_stats:
         print_table(model.stats)
         print("")
 
-    # persist in history
-    reply_text = _clean_llm_text(reply_text)
-    chat.append("bot", reply_text)
+    # Append bot reply to chat history
+    chat_history.append("bot", reply_text)
 
-    # save JSON for non-image text prompts as well (into the last image's file)
+    # ---- Local JSON persistence (optional) ----
     if args.save_json_by_image:
-        try:
-            if last_image:
-                json_path = _json_path_for_image(last_image)
-                cprint(f"[info] saving json → {json_path}", "cyan")
-                if not last_image.lower().startswith(("http://", "https://")):
-                    _ensure_parent_dir(json_path)
-                _append_json(
-                    json_path=json_path,
-                    img_path=last_image,
-                    model=model,
-                    prompt=user_prompt,
-                    reply=reply_text,
-                    indent=args.json_indent,
-                )
+        if last_image_path:
+            json_path = _json_path_for_image(last_image_path)
+            _append_entry_to_json(
+                json_path=json_path,
+                image_path_or_url=last_image_path,
+                model=model,
+                prompt_text=user_prompt,
+                reply_text=reply_text,
+                indent=(None if args.json_indent == 0 else args.json_indent),
+            )
+        else:
+            cprint("[warn] --save-json-by-image is enabled, but no image path/URL was provided yet.", "red")
+
+    # ---- Notify comm-manager (message-only) ----
+    if args.notify_url and reply_text.strip():
+        status, body = _http_post_text(args.notify_url.strip(), reply_text.strip(), timeout=10.0)
+        if status in (200, 201):
+            cprint(f"[notify] sent caption to {args.notify_url} (status {status})", "cyan")
+        else:
+            cprint(f"[notify][warn] failed to notify {args.notify_url} (status {status}): {body}", "yellow")
+
+    return reply_text
+
+
+# ---------------------------
+# HTTP Server mode (Flask)
+# ---------------------------
+
+if args.server:
+    # Lazy import so Flask is only required in --server mode.
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    @app.route("/describe", methods=["POST"])
+    def describe():
+        """
+        JSON in:
+          {
+            "image_path": "/data/images/01.jpg",   # required
+            "question": "optional follow-up"       # optional
+          }
+
+        Behavior:
+          - Hard reset of chat context for every request (prevents leakage).
+          - Append the image (no generation).
+          - Auto-inject "Describe the image" and generate.
+          - If 'question' provided, ask it as a second turn and generate.
+          - Local JSON-by-image saving remains intact via process_user_prompt.
+          - If --notify-url is set, each generation is sent as text/plain to it.
+        """
+        body = request.get_json(force=True, silent=False) or {}
+        image_path = (body.get("image_path") or "").strip()
+        question   = (body.get("question")   or "").strip()
+
+        if not image_path:
+            return jsonify({"error": "image_path is required"}), 400
+
+        with _run_lock:
+            # RESET between requests
+            chat_history.reset()
+            globals()['last_image_path'] = None
+
+            # 1) add the image to history (no generation)
+            process_user_prompt(image_path, generate=False)
+
+            # 2) auto prompt
+            auto_prompt = "Describe the objects in the image"
+            resp_describe = process_user_prompt(auto_prompt, generate=True)
+
+            # 3) optional follow-up
+            resp_question = None
+            if question:
+                resp_question = process_user_prompt(question, generate=True)
+
+        return jsonify({
+            "ok": True,
+            "image_path": image_path,
+            "auto_prompt": auto_prompt,
+            "response_describe": resp_describe,
+            "response_question": resp_question
+        })
+
+    @app.get("/health")
+    def health():
+        """Simple health endpoint to verify server is up."""
+        return jsonify({"ok": True, "time": int(time.time())})
+
+    # Start the server and exit the CLI flow
+    app.run(host="0.0.0.0", port=args.port)
+    sys.exit(0)
+
+
+# ---------------------------
+# CLI mode (unchanged behavior)
+# ---------------------------
+
+while True:
+    if chat_history.turn("user"):
+        # Fetch next prompt
+        if isinstance(prompts, list):
+            if len(prompts) > 0:
+                user_prompt = prompts.pop(0)
+                cprint(f">> PROMPT: {user_prompt}", args.prompt_color)
             else:
-                cprint("[warn] --save-json-by-image is enabled, but no image path/URL was provided yet.", "red")
-        except Exception as e:
-            cprint(f"[error] failed to save JSON: {e}", "red")
-            traceback.print_exc()
+                break
+        else:
+            cprint(">> PROMPT: ", args.prompt_color, end="", flush=True)
+            user_prompt = sys.stdin.readline().strip()
 
-    # optional: tool-calls
+        print("")
+
+        # Load from file or reset if needed
+        if user_prompt.lower().endswith((".txt", ".json")):
+            user_prompt = " ".join(load_prompts(user_prompt))
+        elif user_prompt.lower() in ("reset", "clear"):
+            logging.info("resetting chat history")
+            chat_history.reset()
+            last_image_path = None
+            continue
+
+        # Process one cycle with the given prompt
+        process_user_prompt(user_prompt)
+
+    # Optional tool functions
     if args.enable_tools:
-        try:
-            tool_resp = BotFunctions.run(reply_text, template=chat.template)
-            if tool_resp:
-                chat.append("tool_response", tool_resp)
-                cprint(tool_resp, "yellow")
-        except Exception as e:
-            cprint(f"[warn] tool execution failed: {e}", "red")
-
-    # the image-trigger applies only on the exact turn of image input
-    last_input_was_image = False
+        tool_response = BotFunctions.run(
+            chat_history.messages[-1]["content"] if chat_history.messages else "",
+            template=chat_history.template
+        )
+        if tool_response:
+            chat_history.append("tool_response", tool_response)
+            cprint(tool_response, "yellow")
