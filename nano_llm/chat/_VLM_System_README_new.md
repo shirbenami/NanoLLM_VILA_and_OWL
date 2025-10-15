@@ -8,19 +8,30 @@
        │
        │ Sends image_path requests to
        ▼
-🌐 main_with_time_and_json_and_image_http.py (VILA API Server) (run the main from : /opt/NanoLLM/nano_llm/chat/__main__.py)
+🌐 VILA API Server - main_with_time_and_json_and_image_http.py (VILA API Server) (run the main from : /opt/NanoLLM/nano_llm/chat/__main__.py)
        │
-       │ Visualized by
+       │ Generates textual description for each image
        ▼
 🌈 display_server.py (Web GUI Viewer) (take the files from /home/user/jetson-containers/data/images/captures/)
        └── http://<DEVICE_IP>:8090  ←  Live dashboard for images + captions
        │
-       │ Forwards results to 
+       │  Sends captions to
        ▼
 🖥️ comm_manager.py 
        │
-       │ http://172.16.17.11:5050/prompts
+       │ Forwards description to LLM on Jetson #2 → extracts object list
+       | http://172.16.17.11:5050/prompts
        ▼
+🤖 NanoOWL (Object Detection Engine)
+       │
+       │ Receives the image + object list → returns bounding boxes
+       ▼
+🎨 Automatic OpenCV Annotator
+       │
+       └── Saves <basename>_ann.jpg next to each original image
+             (with BBOX and labels)
+
+
 ```
 
 This creates a full real-time pipeline from **camera capture** → **VLM description** → **remote collection**, ready for robotics, AI perception, or dataset generation workflows.
