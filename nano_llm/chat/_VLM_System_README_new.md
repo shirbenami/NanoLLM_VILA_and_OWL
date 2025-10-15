@@ -227,7 +227,8 @@ pip install flask
 python3 display_server.py \
   --root /home/user/jetson-containers/data/images/captures \
   --host 0.0.0.0 \
-  --port 8090
+  --port 8090 \
+  --latest-only 
 ```
 Adjust the --root path if your captures are stored elsewhere
 (e.g. /home/user/ingested for the remote collector machine).
@@ -250,7 +251,7 @@ The interface auto-refreshes every 2 seconds — you can also press “Refresh n
 ### 4. comm_manager.py 
 
 ```bash
-python3 comm_manager.py   --host 0.0.0.0 --port 5050   --jetson2-endpoint http://172.16.17.11:5050/prompts
+python3 comm_manager.py   --host 0.0.0.0 --port 5050   --jetson2-endpoint http://172.16.17.11:5050/prompts   --captures-root /home/user/jetson-containers/data/images/captures   --nanoowl-endpoint http://172.16.17.12:5060/infer   --forward-timeout 25   --forward-retries 5   --nanoowl-timeout 60   --nanoowl-annotate 0
 ```
 
 
