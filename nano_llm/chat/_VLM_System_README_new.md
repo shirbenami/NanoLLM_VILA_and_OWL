@@ -39,6 +39,10 @@ This creates a **real-time, closed-loop multimodal system** connecting:
 ---
 
 ## 🔹 **Pipeline Stages**
+first- get in to the jetson:
+```
+ssh -X user@172.16.17.12
+```
 
 ### 1. `capture_frames.py`
 
