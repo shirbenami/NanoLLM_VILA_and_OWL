@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VLM Ingest DISPLAY Server — Web UI to view ingested images + captions
+VLM Ingest DISPLAY Server — Cute Web GUI for viewing ingested images + captions
 
 What it does
 ------------
-- Serves a lightweight web UI that shows every <image + description> pair found
-  under an "ingested" directory (from your receiver `/ingest`).
-- Auto-refreshes every N seconds to pick up new arrivals.
+- Serves a lightweight web UI that shows every <image + description> pair received
+  into an "ingested" directory (from your receiver `/ingest`).
+- Auto-refreshes every 2 seconds to pick up new arrivals.
 - Click a card to open a modal with a large preview and the raw JSON metadata.
 
 Assumptions about files in ROOT_DIR
@@ -23,20 +23,28 @@ Assumptions about files in ROOT_DIR
 Usage
 -----
 python3 display_server.py --root /path/to/ingested --host 0.0.0.0 --port 8090
-Optional:
-  --static /path/to/static   # directory that contains sparks.jpg (logo)
 
 Dependencies
 ------------
-- Flask only
+- Flask only (no sockets or DB needed)
   pip install flask
+
+Notes
+-----
+- Designed to run on the same machine that stores the ingested folder, 
+  but can also run on a different host if it mounts that folder.
+- If your receiver saves with different names, you can adapt the MATCH_GLOB below.
 """
 
 import argparse
 import json
+import mimetypes
+import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template_string, send_from_directory, request, abort
 
@@ -50,8 +58,7 @@ def parse_args():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--scan-interval", type=float, default=2.0, help="Seconds between UI auto-refreshes")
-    p.add_argument("--latest-only", action="store_true",
-                   help="Show only the most-recent subfolder under --root (auto-updates on refresh)")
+    p.add_argument("--latest-only", action="store_true",help="Show only the most-recent subfolder under --root (auto-updates on refresh)")
     p.add_argument("--static", dest="static_dir", default=None,
                    help="Directory for static assets (logo, etc.). Defaults to './static' next to this script.")
     return p.parse_args()
@@ -65,12 +72,13 @@ JSON_EXT = ".json"
 
 @dataclass
 class Item:
-    basename: str
-    image_rel: str     # relative to ROOT
-    json_rel: Optional[str]
-    mtime: float
-    text: str
-    llm_terms: List[str] | None = None
+    basename: str              # file base w/o extension
+    image_rel: str             # relative path from ROOT
+    json_rel: Optional[str]    # relative path from ROOT (may be None)
+    mtime: float               # latest mtime among image/json
+    text: str                  # extracted caption/answer (best-effort)
+    llm_terms: List[str] = None      #  LLM (nanoowl.prompts)
+    owl_labels: List[str] = None     # OWL labels
 
 # -----------------
 # Utilities
@@ -80,7 +88,8 @@ def _extract_llm_terms(doc: Dict) -> List[str]:
     try:
         terms = doc.get("nanoowl", {}).get("prompts", [])
         if isinstance(terms, list):
-            seen, out = set(), []
+            seen = set()
+            out = []
             for t in terms:
                 s = str(t).strip()
                 if s and s not in seen:
@@ -91,7 +100,34 @@ def _extract_llm_terms(doc: Dict) -> List[str]:
         pass
     return []
 
+def _extract_owl_labels(doc: Dict) -> List[str]:
+    labels = []
+    try:
+        dets = doc.get("nanoowl", {}).get("result", {}).get("detections", [])
+        if isinstance(dets, list):
+            for d in dets:
+                lab = d.get("label")
+                if isinstance(lab, str) and lab.strip():
+                    labels.append(lab.strip())
+        seen = set()
+        uniq = []
+        for x in labels:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+    except Exception:
+        return []
+
+
+
+def _ann_variant(path: Path) -> Path:
+    """Return <basename>_ann.jpg next to the original image."""
+    return path.with_suffix("").with_name(path.stem + "_ann").with_suffix(".jpg")
+
+
 def _latest_run_dir(root: Path) -> Optional[Path]:
+    """Return newest immediate subdirectory under root (by mtime)."""
     try:
         subdirs = [d for d in root.iterdir() if d.is_dir()]
         if not subdirs:
@@ -104,14 +140,16 @@ def _latest_run_dir(root: Path) -> Optional[Path]:
 def _is_image(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTS
 
+
 def _best_json_for_image(img_path: Path) -> Optional[Path]:
+    """Return JSON that sits next to the image (same basename + .json)."""
     cand = img_path.with_suffix(JSON_EXT)
     return cand if cand.exists() else None
 
 def _extract_text(doc: dict) -> str:
     """
     Extract clean human-readable text for display.
-    Priority: entries[0].response → response_describe → common fallbacks.
+    Priority: entries[0].response → response_describe → fallback keys.
     """
     try:
         entries = doc.get("entries")
@@ -133,45 +171,62 @@ def _extract_text(doc: dict) -> str:
 
     return "(no textual description found in JSON)"
 
+
+
 def _collect_items(root: Path, rel_root: Path) -> List[Item]:
     items: List[Item] = []
-    seen = set()
+    seen_keys = set()  
 
     for img_path in root.glob("**/*"):
-        if not img_path.is_file() or not _is_image(img_path):
+        if not img_path.is_file():
             continue
+        if not _is_image(img_path):
+            continue
+
         if img_path.stem.endswith("_ann"):
             continue
 
+        ann_path = _ann_variant(img_path)
+        use_path = ann_path if ann_path.exists() else img_path
+
         key = img_path.stem
-        if key in seen:
+        if key in seen_keys:
             continue
-        seen.add(key)
+        seen_keys.add(key)
 
         json_path = _best_json_for_image(img_path)
+
         text = ""
         llm_terms: List[str] = []
-        mtimes = [img_path.stat().st_mtime]
+        owl_labels: List[str] = []
+        mtime_list = [img_path.stat().st_mtime]
+
+        if ann_path.exists():
+            try:
+                mtime_list.append(ann_path.stat().st_mtime)
+            except Exception:
+                pass
 
         if json_path and json_path.exists():
             try:
-                doc = json.loads(Path(json_path).read_text(encoding="utf-8"))
+                with open(json_path, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
                 text = _extract_text(doc)
                 llm_terms = _extract_llm_terms(doc) or []
-                mtimes.append(json_path.stat().st_mtime)
+                owl_labels = _extract_owl_labels(doc) or []
+                mtime_list.append(json_path.stat().st_mtime)
             except Exception:
                 text = "(failed to read/parse JSON)"
 
-        items.append(
-            Item(
-                basename=img_path.stem,
-                image_rel=str(img_path.relative_to(rel_root)),
-                json_rel=(str(json_path.relative_to(rel_root)) if json_path else None),
-                mtime=max(mtimes),
-                text=text,
-                llm_terms=llm_terms,
-            )
-        )
+        items.append(Item(
+            basename=use_path.stem,
+            image_rel=str(use_path.relative_to(rel_root)),                 
+            json_rel=(str(json_path.relative_to(rel_root)) if json_path else None),
+            mtime=max(mtime_list),
+            text=text,
+            llm_terms=llm_terms,
+            owl_labels=owl_labels,
+        ))
 
     items.sort(key=lambda it: it.mtime, reverse=True)
     return items
@@ -180,20 +235,17 @@ def _collect_items(root: Path, rel_root: Path) -> List[Item]:
 # Flask app
 # -----------------
 
-def create_app(root_dir: Path, scan_interval: float, latest_only: bool, static_dir: Path) -> Flask:
+def create_app(root_dir: Path, scan_interval: float, latest_only: bool,  static_dir: Path) -> Flask:
     app = Flask(__name__)
-    app.config.update(
-        ROOT_DIR=root_dir,
-        SCAN_INTERVAL=scan_interval,
-        LATEST_ONLY=latest_only,
-        STATIC_DIR=static_dir,
-    )
+    app.config["ROOT_DIR"] = root_dir
+    app.config["SCAN_INTERVAL"] = scan_interval
+    app.config["LATEST_ONLY"] = latest_only
+    app.config["STATIC_DIR"] = static_dir
 
     @app.get("/")
     def index():
-        return render_template_string(
-            INDEX_HTML,
-            scan_interval=app.config["SCAN_INTERVAL"],
+        return render_template_string(INDEX_HTML,
+            scan_interval=app.config["SCAN_INTERVAL"]
         )
 
     @app.get("/api/items")
@@ -207,7 +259,7 @@ def create_app(root_dir: Path, scan_interval: float, latest_only: bool, static_d
             if last_dir is not None:
                 scan_root = last_dir
                 current_run = str(last_dir.relative_to(root))
-
+    
         items = _collect_items(scan_root, rel_root=root)
         payload = [
             {
@@ -217,19 +269,11 @@ def create_app(root_dir: Path, scan_interval: float, latest_only: bool, static_d
                 "mtime": it.mtime,
                 "text": it.text,
                 "llm_terms": it.llm_terms or [],
+                "owl_labels": it.owl_labels or [],
             }
             for it in items
         ]
-        return jsonify(
-            {
-                "ok": True,
-                "count": len(payload),
-                "items": payload,
-                "root": str(root),
-                "scan_root": str(scan_root),
-                "current_run": current_run,
-            }
-        )
+        return jsonify({"ok": True, "count": len(payload), "items": payload, "root": str(root), "scan_root": str(scan_root), "current_run": current_run})
 
     @app.get("/img/<path:rel>")
     def serve_image(rel: str):
@@ -239,7 +283,9 @@ def create_app(root_dir: Path, scan_interval: float, latest_only: bool, static_d
             abort(403)
         if not full.exists() or not full.is_file():
             abort(404)
-        return send_from_directory(str(full.parent), full.name)
+        directory = str(full.parent)
+        filename = full.name
+        return send_from_directory(directory, filename)
 
     @app.get("/meta/<path:rel>")
     def serve_json(rel: str):
@@ -249,7 +295,11 @@ def create_app(root_dir: Path, scan_interval: float, latest_only: bool, static_d
             abort(403)
         if not full.exists() or not full.is_file():
             abort(404)
-        return send_from_directory(str(full.parent), full.name, mimetype="application/json")
+        directory = str(full.parent)
+        filename = full.name
+        return send_from_directory(directory, filename, mimetype="application/json")
+
+    return app
 
     @app.get("/static/<path:filename>")
     def serve_static(filename: str):
@@ -262,7 +312,6 @@ def create_app(root_dir: Path, scan_interval: float, latest_only: bool, static_d
         return send_from_directory(str(full.parent), full.name)
 
     return app
-
 
 # -----------------
 # HTML template (inline)
@@ -278,25 +327,10 @@ INDEX_HTML = r"""
   <style>
     :root { --bg:#0f172a; --card:#111827; --ink:#e2e8f0; --muted:#9ca3af; --accent:#22d3ee; }
     html,body { margin:0; padding:0; background:var(--bg); color:var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
-    header { display:flex; align-items:center; gap:14px; padding:14px 18px; border-bottom:1px solid #1f2937; position:sticky; top:0; background:linear-gradient(180deg, rgba(15,23,42,.95), rgba(15,23,42,.75)); backdrop-filter: blur(6px); }
-    header .titles {
-      position: absolute;
-      left: 50%;
-      transform: translateX(-50%);
-      text-align: center;
-    }
-
-    header .titles h1 {
-      margin: 0;
-      font-size: 28px;
-      font-weight: 700;
-      color: #ffffff;
-    }
-
-    header .brand { flex-direction:column; align-items:center; }
-    header img.logo { height:80px; width:auto; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+    header { display:flex; gap:12px; align-items:center; padding:14px 18px; border-bottom:1px solid #1f2937; position:sticky; top:0; background:linear-gradient(180deg, rgba(15,23,42,.95), rgba(15,23,42,.75)); backdrop-filter: blur(6px); }
+    h1 { margin:0; font-size:35px; letter-spacing:0.3px; }
+    .logo { height: 80px; width: auto; border-radius: 10px; margin-right: 10px;}
     .badge { background:#0ea5b7; color:#002227; padding:2px 8px; border-radius:999px; font-weight:700; font-size:12px; }
-    .spacer { flex:1 1 auto; }
     .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap:14px; padding:18px; }
     .card { background:var(--card); border:1px solid #1f2937; border-radius:16px; overflow:hidden; box-shadow:0 8px 24px rgba(0,0,0,.25); transition: transform .15s ease, box-shadow .15s ease; }
     .card:hover { transform: translateY(-2px); box-shadow:0 12px 28px rgba(0,0,0,.35); }
@@ -307,12 +341,17 @@ INDEX_HTML = r"""
     .mtime { font-size:12px; color:#7dd3fc; }
     .text { font-size:14px; line-height:1.35; color:#e5e7eb; max-height:72px; overflow:hidden; mask-image: linear-gradient(to bottom, black 70%, transparent 100%); }
     .row { display:flex; gap:8px; align-items:center; }
-    .btn { cursor:pointer; border:1px solid #1f2937; background:#0b1325; color:#e2e8f0; padding:8px 10px; border-radius:12px; font-size:13px; text-decoration:none; }
+    .btn { cursor:pointer; border:1px solid #1f2937; background:#0b1325; color:#e2e8f0; padding:8px 10px; border-radius:12px; font-size:13px; }
     .btn:hover { background:#0e162f; }
+
+    /* chips for LLM terms */
     .chips { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
     .chips-title { color:#9ca3af; font-size:12px; margin-right:4px; }
     .chip { display:inline-block; font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid #1f2937; background:#0b1325; color:#e5e7eb; }
+
     .footer { color:#9ca3af; font-size:12px; padding:6px 18px 14px; text-align:center; }
+
+    /* Modal */
     .modal { position:fixed; inset:0; display:none; background:rgba(0,0,0,.5); align-items:center; justify-content:center; padding:20px; }
     .modal.open { display:flex; }
     .modal-card { max-width:1100px; width:100%; max-height:90vh; background:#0b1220; border:1px solid #253044; border-radius:18px; overflow:hidden; display:grid; grid-template-columns: 1.1fr 0.9fr; }
@@ -327,15 +366,10 @@ INDEX_HTML = r"""
 </head>
 <body>
   <header>
-    <div class="brand">
-      <img class="logo" src="/static/sparks.jpg" alt="SPARX Innovation logo" />
-      <div class="titles">
-        <h1>VLM Ingest Viewer 📸</h1>
-      </div>
-    </div>
-    <span class="spacer"></span>
+    <img src="/static/sparks.jpg" alt="Logo" class="logo" />
+    <h1>VLM Ingest Viewer</h1>
     <span class="badge" id="count">0</span>
-    <div style="display:flex; gap:10px; align-items:center; margin-left:10px;">
+    <div style="margin-left:auto; display:flex; gap:10px; align-items:center;">
       <small style="color:var(--muted)">Auto-refresh <b id="interval"></b> sec</small>
       <button class="btn" id="refreshBtn">Refresh now</button>
     </div>
@@ -366,7 +400,7 @@ INDEX_HTML = r"""
       try { return new Date(ts*1000).toLocaleString(); } catch(e){ return String(ts); }
     }
 
-    // Safely collapse newlines and remove </s>
+    // safely collapse newlines and remove </s>
     function cleanText(s){
       return (s || '')
         .replace(/\r?\n/g, ' ')
@@ -374,6 +408,7 @@ INDEX_HTML = r"""
         .trim();
     }
 
+    // build a chip row (LLM only)
     function chipRow(title, arr){
       if(!arr || !arr.length) return '';
       const chips = arr.map(x => `<span class="chip" title="${x}">${x}</span>`).join('');
@@ -385,17 +420,19 @@ INDEX_HTML = r"""
       document.getElementById('count').textContent = items.length;
       grid.innerHTML = items.map(it => `
         <div class="card" onclick="openModal(${encodeURIComponent(JSON.stringify(JSON.stringify(it)))})">
-          <img class="thumb" src="\${it.image}" alt="\${it.basename}" />
+          <img class="thumb" src="${it.image}" alt="${it.basename}" />
           <div class="body">
             <div class="title">
-              <div class="basename" title="\${it.basename}">\${it.basename}</div>
-              <div class="mtime">\${fmtTime(it.mtime)}</div>
+              <div class="basename" title="${it.basename}">${it.basename}</div>
+              <div class="mtime">${fmtTime(it.mtime)}</div>
             </div>
-            \${chipRow('LLM', it.llm_terms)}
-            <div class="text">\${cleanText(it.text)}</div>
+
+            ${chipRow('LLM', it.llm_terms)}
+
+            <div class="text">${cleanText(it.text)}</div>
             <div class="row">
-              \${it.json ? `<a class="btn" href="\${it.json}" target="_blank">Open JSON</a>` : ''}
-              <a class="btn" href="\${it.image}" target="_blank">Open Image</a>
+              ${it.json ? `<a class="btn" href="${it.json}" target="_blank">Open JSON</a>` : ''}
+              <a class="btn" href="${it.image}" target="_blank">Open Image</a>
             </div>
           </div>
         </div>
@@ -425,10 +462,12 @@ INDEX_HTML = r"""
       document.getElementById('modalImg').src = it.image;
       document.getElementById('modalTitle').textContent = it.basename + ' — ' + fmtTime(it.mtime);
 
+      // LLM chips + caption (no OWL)
       const llmRow = chipRow('LLM', it.llm_terms || []);
-      const caption = `<div style="margin-top:8px">\${cleanText(it.text)}</div>`;
+      const caption = `<div style="margin-top:8px">${cleanText(it.text)}</div>`;
       document.getElementById('modalText').innerHTML = llmRow + caption;
 
+      // pretty JSON
       let pretty = '{}';
       try{
         if(it.json){
@@ -453,14 +492,12 @@ INDEX_HTML = r"""
 </body>
 </html>
 """
-
 # -----------------
 # Entrypoint
 # -----------------
 
 def main():
     args = parse_args()
-
     root = Path(args.root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise SystemExit(f"ROOT dir not found: {root}")
@@ -473,6 +510,7 @@ def main():
     static_dir.mkdir(parents=True, exist_ok=True)  # keep it simple
 
     app = create_app(root, args.scan_interval, args.latest_only, static_dir)
+
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 
