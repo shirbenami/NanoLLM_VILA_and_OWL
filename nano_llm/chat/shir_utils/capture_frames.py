@@ -1,313 +1,570 @@
 #!/usr/bin/env python3
-# capture_frames.py
-import datetime
-import os, json, time, argparse, cv2
-from pathlib import Path
-from typing import Optional, Tuple
-import requests
+# -*- coding: utf-8 -*-
 
-def _fmt_signed(value: float, scale: int, width: int, eps: float) -> str:
-    if abs(value) < eps:
-        value = 0.0
-    n = int(round(value * scale))
-    if n < 0:
-        return f"-{abs(n):0{width}d}"
-    else:
-        return f"{n:0{width}d}"
+"""
+comm_manager.py
 
-def pose_to_name(pose: dict) -> str:
-    x = _fmt_signed(pose["x"],   scale=1000,      width=4, eps=5e-4)     # mm
-    y = _fmt_signed(pose["y"],   scale=1000,      width=4, eps=5e-4)     # mm
-    z = _fmt_signed(pose["z"],   scale=1000,      width=4, eps=5e-4)     # mm
-    yaw = _fmt_signed(pose["yaw"], scale=1_000_000, width=7, eps=5e-7)   # microrad
-    timestamp = datetime.datetime.now().strftime("%Y_%m_%d___%H_%M_%S")
+Flow:
+  1) Receive caption from VILA via POST /from_vila  (Content-Type: text/plain)
+  2) Forward caption to Jetson2 /prompts -> expect {"prompts":[...]}
+  3) Only after prompts are received, find the latest captured image under --captures-root
+  4) POST to NanoOWL /infer with multipart form:
+        -F image=@/path/to/image.jpg
+        -F prompts='["one","two","..."]'
+        -F annotate=0/1
+  5) Write OWL output into the sidecar JSON of that image under key "nanoowl"
+  6) **NEW:** Auto-annotate the image with OpenCV (draw BBox + label),
+     writing <basename>_ann.jpg next to the original image.
 
-    return f"x{x}y{y}z{z}yaw{yaw}__{timestamp}"
+Notes:
+- This manager does NOT send images or JSON to remote machines other than:
+    * Jetson2 (/prompts) for prompts
+    * NanoOWL (/infer) for detections
+- It stores OWL results locally in the image's JSON and renders an annotated image.
+"""
 
-def open_capture(src: str, width=None, height=None, fps=None, fourcc=None):
-    if "://" in src:
-        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception: pass
-        if not cap.isOpened():
-            raise RuntimeError(f"failed to open network/file source: {src}")
-        return cap
+from flask import Flask, request, jsonify
+import os
+import json
+import time
+import glob
+import argparse
+from collections import deque
+import hashlib
+import re
+import urllib.request, urllib.error  # for Jetson2 JSON POST
+import requests                      # for NanoOWL multipart
+import cv2                           # for drawing boxes
 
-    if src.startswith("/dev/video"):
-        cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-        if cap.isOpened():
-            if fourcc:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-            if width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH,  int(width))
-            if height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-            if fps:    cap.set(cv2.CAP_PROP_FPS,          float(fps))
-            try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception: pass
-            ok,_ = cap.read()
-            if ok: return cap
-            cap.release()
+app = Flask(__name__)
 
-        # fallback GStreamer
-        gst = (
-            f"v4l2src device={src} io-mode=2 do-timestamp=true ! "
-            f"image/jpeg,framerate={int(fps) if fps else 30}/1 "
-            f"! jpegdec ! videoconvert ! video/x-raw,format=BGR "
-            f"! appsink drop=true max-buffers=1 sync=false"
-            if (fourcc or "MJPG") == "MJPG" else
-            f"v4l2src device={src} io-mode=2 do-timestamp=true ! "
-            f"video/x-raw,format=YUY2,framerate={int(fps) if fps else 30}/1 "
-            f"! videoconvert ! video/x-raw,format=BGR "
-            f"! appsink drop=true max-buffers=1 sync=false"
-        )
-        cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-        if cap.isOpened():
-            return cap
-        raise RuntimeError(f"failed to open V4L2 source: {src}")
+# --- Runtime configuration (populated from CLI args) ---
+JETSON2_ENDPOINT = None      # e.g., http://172.16.17.11:5050/prompts
+NANOOWL_ENDPOINT = None      # e.g., http://172.16.17.11:5060/infer
+CAPTURES_ROOT = None         # e.g., /home/user/jetson-containers/data/images/captures
 
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        raise RuntimeError(f"failed to open source: {src}")
-    return cap
+FORWARD_TIMEOUT = 20.0       # Jetson2 prompts timeout
+FORWARD_RETRIES = 3          # Jetson2 prompts retries
 
-def _remap_path(local_path: str, src_root: Optional[str], dst_root: Optional[str]) -> str:
-    if not src_root or not dst_root:
-        return os.path.abspath(local_path)
-    local_path = os.path.abspath(local_path)
-    src_root = os.path.abspath(src_root)
+NANOOWL_TIMEOUT = 45.0       # NanoOWL infer timeout
+NANOOWL_ANNOTATE = 0         # annotate flag sent to NanoOWL (0/1)
+
+_ANN_RE = re.compile(r"_ann\.(jpg|jpeg|png)$", re.IGNORECASE)
+
+FORWARD_JSON_URL = None       # e.g., http://172.17.16.9:9090/ingest
+FORWARD_JSON_TIMEOUT = 8.0
+FORWARD_JSON_RETRIES = 3
+
+# --- Simple in-memory log/state for quick debugging ---
+HISTORY = deque(maxlen=200)
+LAST = {
+    "vila_caption": None,        # {"ts": int, "text": str}
+    "jetson2_prompts": None,     # {"ts": int, "prompts": [str]}
+    "last_forward_status": None, # {"status": int, "body": str/dict}
+    "last_image_path": None,     # str
+    "nanoowl_result": None,      # {"status": int, "body": any}
+}
+
+# -------------------- Helpers --------------------
+
+def _http_post_json(url: str, payload: dict, timeout: float = 6.0):
+    """
+    POST JSON using stdlib (no requests). Returns (status_code, response_text).
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        rel = os.path.relpath(local_path, src_root)
-    except ValueError:
-        return local_path
-    return os.path.join(dst_root, rel)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            body = resp.read().decode("utf-8", errors="replace")
+            return status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
+        return e.code, body
+    except Exception as e:
+        return -1, str(e)
 
-def _call_vlm(endpoint: Optional[str], image_path_for_vlm: str, timeout: float, retries: int) -> Optional[str]:
-    if not endpoint:
-        return None
-    payload = {"image_path": image_path_for_vlm}
-    last_err = None
-    for _ in range(max(1, retries)):
-        try:
-            r = requests.post(endpoint, json=payload, timeout=timeout)
-            r.raise_for_status()
+
+def _find_latest_image_and_json(root_dir: str):
+    """
+    Recursively find the most recent JPG/JPEG/PNG under root_dir and return
+    (image_path, json_path). If the matching JSON doesn't exist yet, json_path
+    will be the expected sidecar path (same basename, .json).
+    """
+    """
+    Find the most recent *original* image (NOT an _ann image) and its sidecar JSON.
+    """
+    if not root_dir or not os.path.isdir(root_dir):
+        return None, None
+
+    patterns = ["**/*.jpg", "**/*.jpeg", "**/*.png"]
+    latest_img = None
+    latest_mtime = -1.0
+
+    for pat in patterns:
+        for fp in glob.glob(os.path.join(root_dir, pat), recursive=True):
+            # דלג על תמונות שכבר מסומנות
+            if _ANN_RE.search(fp):
+                continue
             try:
-                data = r.json()
-                if isinstance(data, dict):
-                    return data.get("response") or data.get("caption") or json.dumps(data, ensure_ascii=False)
-                return json.dumps(data, ensure_ascii=False)
-            except ValueError:
-                return r.text.strip()
-        except Exception as e:
-            last_err = e
-            time.sleep(0.2)
-    print(f"[vlm] WARN: describe failed for {image_path_for_vlm}: {last_err}")
-    return None
+                mtime = os.path.getmtime(fp)
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_img = fp
+            except Exception:
+                pass
 
-def _update_sidecar_json(json_path: str, pose: dict, image_basename: str, vlm_text: Optional[str]):
+    if not latest_img:
+        return None, None
+
+    base, _ = os.path.splitext(latest_img)
+    sidecar_json = base + ".json"
+    return latest_img, sidecar_json
+
+def _update_sidecar_json(json_path: str, updater: dict):
+    """
+    Safe write/update to sidecar JSON:
+      - read existing dict or start a new one
+      - merge 'updater' keys
+      - write atomically via *.tmp then replace
+    """
     obj = {}
     if os.path.isfile(json_path):
         try:
-            with open(json_path, "r") as f:
+            with open(json_path, "r", encoding="utf-8") as f:
                 obj = json.load(f)
         except Exception:
             obj = {}
-    obj.setdefault("pose", pose)
-    obj.setdefault("image", image_basename)
-    if vlm_text:
-        obj["vlm_caption"] = vlm_text
-        entries = obj.setdefault("entries", [])
-        entries.append({
-            "timestamp": int(time.time()),
-            "prompt": "Describe the image",
-            "response": vlm_text
-        })
+
+    # Merge/update top-level keys in-place
+    for k, v in updater.items():
+        obj[k] = v
+
     tmp = json_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp, json_path)
 
-def _parse_manual_pose(s: Optional[str]) -> dict:
-    # "x,y,z,yaw" -> dict
-    if not s:
-        return {"x": 0.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
-    parts = [p.strip() for p in s.split(",")]
-    if len(parts) != 4:
-        raise ValueError("--manual-pose must be 'x,y,z,yaw'")
-    x, y, z, yaw = map(float, parts)
-    return {"x": x, "y": y, "z": z, "yaw": yaw}
 
-def _unique_name(base_path: str, enable_suffix: bool, counter: int) -> Tuple[str, str]:
+def _post_nanoowl_multipart(endpoint: str, image_path: str, prompts: list[str],
+                            annotate: int, timeout: float):
     """
-    Return (jpg_path, json_path). If enable_suffix, append _0001, _0002...
+    Send multipart/form-data to NanoOWL:
+      files: image=@<path>
+      data:  prompts='["a","b"]', annotate='0'/'1'
+    Returns (status_code, response_json_or_text)
     """
-    timestamp = datetime.datetime.now().strftime("%Y_%m_%d___%H_%M_%S")
-    base_path = f"{base_path}___{timestamp}"
-    jpg_path = base_path + ".jpg"
-    json_path = base_path + ".json"
-    if not enable_suffix:
-        return jpg_path, json_path
-    n = counter
-    while True:
-        suffix = f"_{n:04d}"
-        jp = base_path + suffix + ".jpg"
-        jj = base_path + suffix + ".json"
-        if not (os.path.exists(jp) or os.path.exists(jj)):
-            return jp, jj
-        n += 1
+    if not endpoint:
+        return -1, "nanoowl endpoint not configured"
+    if not (image_path and os.path.isfile(image_path)):
+        return -1, f"image not found: {image_path}"
+    files = {"image": (os.path.basename(image_path), open(image_path, "rb"), "application/octet-stream")}
+    data = {"prompts": json.dumps(prompts or []), "annotate": str(int(annotate))}
+    try:
+        r = requests.post(endpoint, files=files, data=data, timeout=timeout)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return r.status_code, body
+    except Exception as e:
+        return -1, str(e)
+
+
+
+
+# -------------------- Annotation utilities (OpenCV) --------------------
+
+def _color_for_label(label: str):
+    """
+    Deterministic BGR color from label string.
+    """
+    h = hashlib.md5(label.encode("utf-8")).hexdigest()
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    return (b, g, r)  # OpenCV uses BGR
+
+def _extract_detections(nanoowl_result):
+    """
+    Normalize detections into:
+      [{"label": str, "score": float|None, "bbox": [x1,y1,x2,y2]}]
+    Accepts either:
+      - {"detections": [ ... ]}
+      - [ ... ] (plain list)
+      - {"items": [ ... ]} (fallback)
+    """
+    if nanoowl_result is None:
+        return []
+
+    if isinstance(nanoowl_result, dict) and "detections" in nanoowl_result:
+        dets = nanoowl_result.get("detections") or []
+    elif isinstance(nanoowl_result, list):
+        dets = nanoowl_result
+    elif isinstance(nanoowl_result, dict) and "items" in nanoowl_result:
+        dets = nanoowl_result["items"]
+    else:
+        return []
+
+    norm = []
+    for d in dets:
+        if not isinstance(d, dict):
+            continue
+        label = d.get("label") or d.get("name") or d.get("text") or "object"
+        score = d.get("score") or d.get("confidence") or None
+        bbox  = d.get("bbox") or d.get("box") or d.get("xyxy") or None
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            continue
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+        except Exception:
+            continue
+        norm.append({
+            "label": str(label),
+            "score": (float(score) if score is not None else None),
+            "bbox": [x1, y1, x2, y2]
+        })
+    return norm
+
+def _scale_if_normalized(bbox, W, H):
+    """
+    If bbox looks normalized ([0..1]), scale to pixel coordinates.
+    """
+    x1, y1, x2, y2 = bbox
+    if 0.0 <= x1 <= 1.0 and 0.0 <= y1 <= 1.0 and 0.0 <= x2 <= 1.0 and 0.0 <= y2 <= 1.0:
+        x1 *= W; x2 *= W
+        y1 *= H; y2 *= H
+    return int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+
+def _draw_label_box(img, x1, y1, text, color):
+    """
+    Draw a filled background for readable label text.
+    """
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.1
+    thick = 2
+    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+    cv2.rectangle(img, (x1, max(0, y1 - th - 8)), (x1 + tw + 6, y1), color, thickness=-1)
+    cv2.putText(img, text, (x1 + 3, y1 - 4), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
+def _annotate_from_json(image_path: str, json_path: str):
+    """
+    Read sidecar JSON (expects json["nanoowl"]["result"]), draw boxes + labels
+    and write <basename>_ann.jpg next to the original image.
+    """
+    if not (image_path and os.path.isfile(image_path)):
+        print(f"[annotate][skip] missing image: {image_path}")
+        return False
+    if not (json_path and os.path.isfile(json_path)):
+        print(f"[annotate][skip] missing json: {json_path}")
+        return False
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"[annotate][warn] failed to read json: {e}")
+        return False
+
+    nano = meta.get("nanoowl") or {}
+    result = nano.get("result")
+    dets = _extract_detections(result)
+    if not dets:
+        print("[annotate] no detections; skipping")
+        return False
+
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        print("[annotate][warn] failed to read image")
+        return False
+
+    H, W = img.shape[:2]
+    for d in dets:
+        x1, y1, x2, y2 = _scale_if_normalized(d["bbox"], W, H)
+        x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
+        y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        label = d["label"]
+        score = d["score"]
+        text  = f"{label}" + (f" {score:.2f}" if isinstance(score, float) else "")
+        color = _color_for_label(label)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness=7)
+        _draw_label_box(img, x1, y1, text, color)
+
+    base, _ = os.path.splitext(image_path)
+
+    base = re.sub(r"_ann$", "", base, flags=re.IGNORECASE)
+    out_path = base + "_ann.jpg"
+
+    ok = cv2.imwrite(out_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if ok:
+        print(f"[annotate] wrote {out_path}")
+        return True
+    print("[annotate][error] failed to write annotated image")
+    return False
+
+
+def _load_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _has_any_bbox(nanoowl_section: dict) -> bool:
+    """
+    Returns True iff the nanoowl result contains at least one detection (bbox).
+    Uses the same normalization as _extract_detections().
+    """
+    if not isinstance(nanoowl_section, dict):
+        return False
+    result = nanoowl_section.get("result")
+    dets = _extract_detections(result)
+    return len(dets) > 0
+
+
+def _post_full_json(url: str, obj: dict, timeout: float, retries: int = 3, headers: dict | None = None):
+    if not (url and isinstance(obj, dict)):
+        return -1, "invalid url or payload"
+
+    last_status, last_body = None, None
+    for attempt in range(1, int(retries or 1) + 1):
+        try:
+            data = {"meta": json.dumps(obj, ensure_ascii=False)}
+            r = requests.post(url, data=data, timeout=timeout, headers=headers or {})
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            last_status, last_body = r.status_code, body
+            if 200 <= r.status_code < 300:
+                return last_status, last_body
+            time.sleep(min(1.5 * attempt, 4.0))
+        except Exception as e:
+            last_status, last_body = -1, str(e)
+            time.sleep(min(1.5 * attempt, 4.0))
+    return last_status, last_body
+
+
+# -------------------- HTTP API --------------------
+
+@app.post("/from_vila")
+def from_vila():
+    """
+    Entry point called by VILA (text/plain body = caption).
+    We MUST:
+      1) Forward caption to Jetson2 /prompts and WAIT for prompts.
+      2) Only then find the latest image and call NanoOWL with (image, prompts).
+      3) Store NanoOWL output into the sidecar JSON next to that image.
+      4) **NEW:** Render annotated image _ann.jpg next to the original.
+    """
+    caption = request.get_data(as_text=True, parse_form_data=False).strip()
+    if not caption:
+        return jsonify({"ok": False, "error": "empty caption"}), 400
+
+    ts = int(time.time())
+    print(f"[from_vila][{ts}] {caption}")
+    LAST["vila_caption"] = {"ts": ts, "text": caption}
+    HISTORY.appendleft({"src": "vila", "ts": ts, "text": caption})
+
+    # ---- 1) Send to Jetson2 and wait for prompts ----
+    f_status, f_body, prompts = None, None, None
+    if JETSON2_ENDPOINT:
+        last_err = None
+        for attempt in range(1, int(FORWARD_RETRIES or 1) + 1):
+            f_status, f_body = _http_post_json(
+                JETSON2_ENDPOINT, {"sentence": caption}, timeout=float(FORWARD_TIMEOUT or 10.0)
+            )
+            if f_status not in (-1, 408, 504) and not (isinstance(f_status, int) and f_status >= 500):
+                break
+            last_err = f_body
+            print(f"[forward->jetson2] attempt {attempt} failed: status={f_status} body={str(f_body)[:180]}")
+            time.sleep(min(2.0 * attempt, 6.0))
+
+        print(f"[forward->jetson2] status={f_status} body={f_body[:180] if isinstance(f_body, str) else f_body}")
+        try:
+            data = json.loads(f_body) if isinstance(f_body, str) else {}
+            if isinstance(data, dict) and isinstance(data.get("prompts"), list):
+                prompts = [str(x) for x in data["prompts"]]
+        except Exception:
+            prompts = None
+
+        LAST["last_forward_status"] = {"status": f_status, "body": f_body}
+        if prompts:
+            LAST["jetson2_prompts"] = {"ts": int(time.time()), "prompts": prompts}
+            HISTORY.appendleft({"src": "jetson2", "ts": int(time.time()), "prompts": prompts})
+            print(f"[jetson2][prompts] {prompts}")
+        else:
+            print("[jetson2][warn] no prompts parsed")
+
+    if not prompts:
+        return jsonify({
+            "ok": True,
+            "note": "prompts missing; NanoOWL not called",
+            "forward_status": f_status,
+            "prompts": None
+        })
+
+    # ---- 2) Find latest image + sidecar JSON ----
+    img_path, json_path = _find_latest_image_and_json(CAPTURES_ROOT)
+    LAST["last_image_path"] = img_path
+    if not img_path:
+        print(f"[nanoowl][warn] no image found under {CAPTURES_ROOT}")
+        return jsonify({
+            "ok": False,
+            "error": f"no image found under {CAPTURES_ROOT}",
+            "prompts": prompts
+        }), 500
+    if not json_path:
+        base, _ = os.path.splitext(img_path)
+        json_path = base + ".json"
+
+    # ---- 3) Call NanoOWL ----
+    status, body = _post_nanoowl_multipart(
+        endpoint=NANOOWL_ENDPOINT,
+        image_path=img_path,
+        prompts=prompts,
+        annotate=NANOOWL_ANNOTATE,
+        timeout=NANOOWL_TIMEOUT
+    )
+    LAST["nanoowl_result"] = {"status": status, "body": body if not isinstance(body, str) else body[:2000]}
+    print(f"[nanoowl] status={status} body_type={'json' if isinstance(body, dict) else 'text'}")
+
+    # ---- 4) Write NanoOWL result to sidecar JSON ----
+    now = time.time()
+    iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    nano_payload = {
+        "ts": now,
+        "iso_time": iso,
+        "endpoint": NANOOWL_ENDPOINT,
+        "status": status,
+        "prompts": prompts,
+        "annotate": int(NANOOWL_ANNOTATE),
+        "result": body
+    }
+    try:
+        _update_sidecar_json(json_path, {"nanoowl": nano_payload})
+        print(f"[nanoowl][json] updated: {json_path}")
+
+        # ---- 4.1) If has BBOX, forward the FULL JSON to remote machine ----
+        try:
+            meta = _load_json(json_path)
+            if meta and _has_any_bbox(meta.get("nanoowl")):
+                if FORWARD_JSON_URL:
+                    # 1) take the local sidecar basename (no folders)
+                    sidecar_basename = os.path.basename(json_path)  # e.g. x0200...__11_31_15.json
+
+                    # 2) embed it in the payload so the receiver can save with the SAME name
+                    meta["_sidecar_basename"] = sidecar_basename
+
+                    # 3) (optional) also send as HTTP header for convenience
+                    headers = {"X-Sidecar-Basename": sidecar_basename}
+
+                    # 4) post
+                    s, b = _post_full_json(
+                    url=FORWARD_JSON_URL,
+                    obj=meta,
+                    timeout=FORWARD_JSON_TIMEOUT,
+                    retries=FORWARD_JSON_RETRIES,
+                    headers=headers,             #  <<<<< add
+                )   
+                print(f"[forward-json] url={FORWARD_JSON_URL} status={s} body={b}")
+
+        except Exception as e:
+            print(f"[forward-json][error] {e}")
+
+    except Exception as e:
+        print(f"[nanoowl][json][error] failed to update {json_path}: {e}")
+
+    # ---- 5) **Auto-annotate** and write <basename>_ann.jpg ----
+    ann_ok = _annotate_from_json(img_path, json_path)
+
+    return jsonify({
+        "ok": True,
+        "caption": caption,
+        "prompts": prompts,
+        "image_path": img_path,
+        "nanoowl_status": status,
+        "nanoowl_body": body,
+        "sidecar_json": json_path,
+        "annotated": bool(ann_ok)
+    })
+
+
+@app.get("/latest")
+def latest():
+    return jsonify({"ok": True, "last": LAST})
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "time": int(time.time())})
+
+
+# -------------------- Main --------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", required=True, help="RTSP url or /dev/videoX or file path")
-    ap.add_argument("--poses", default="/opt/missions/poses.json", help="poses.json: [{x,y,z,yaw}, ...]")
-    ap.add_argument("--out", default="captures", help="output directory")
-    ap.add_argument("--sleep", type=float, default=2.0, help="seconds to wait before each grab (pose mode)")
-    ap.add_argument("--warmup", type=int, default=10, help="drop N frames on startup")
-    ap.add_argument("--retry", type=int, default=5, help="frame grab retries per capture")
-    ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--fourcc", default="MJPG", help="MJPG or YUYV for /dev/video cams")
+    global JETSON2_ENDPOINT, NANOOWL_ENDPOINT, CAPTURES_ROOT
+    global FORWARD_TIMEOUT, FORWARD_RETRIES, NANOOWL_TIMEOUT, NANOOWL_ANNOTATE
 
-    # Interactive options
-    ap.add_argument("--interactive", action="store_true", help="Enable keyboard capture mode (space/c).")
-    ap.add_argument("--preview", action="store_true", help="Show OpenCV preview window (required for keypress).")
-    ap.add_argument("--manual-pose", default="", help="Pose used in interactive mode as 'x,y,z,yaw' (default 0,0,1.5,0).")
-    ap.add_argument("--suffix", action="store_true", help="Append _0001, _0002… to interactive captures to avoid overwrite.")
+    p = argparse.ArgumentParser()
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=5050)
 
-    # VLM options
-    ap.add_argument("--vlm", default="", help="VLM describe endpoint, e.g. http://172.16.17.12:8080/describe (empty to disable)")
-    ap.add_argument("--vlm-timeout", type=float, default=30.0)
-    ap.add_argument("--vlm-retries", type=int, default=2)
-    ap.add_argument("--vlm-path-src", default="", help="local root to strip (for path remap), optional")
-    ap.add_argument("--vlm-path-dst", default="", help="remote root to prepend (for path remap), optional")
+    p.add_argument("--jetson2-endpoint", required=True,
+                   help="URL to Jetson-2 prompts endpoint, e.g. http://172.16.17.11:5050/prompts")
+    p.add_argument("--captures-root", required=True,
+                   help="Root where capture_frames saves images+json (used to find latest image)")
+    p.add_argument("--nanoowl-endpoint", required=True,
+                   help="NanoOWL endpoint, e.g. http://172.16.17.11:5060/infer")
 
-    args = ap.parse_args()
+    p.add_argument("--forward-timeout", type=float, default=20.0,
+                   help="Timeout (sec) for POST to Jetson-2")
+    p.add_argument("--forward-retries", type=int, default=3,
+                   help="Retries for POST to Jetson-2 on failure/timeout")
 
-    # If interactive is requested, turn on preview unless explicitly off
-    if args.interactive and not args.preview:
-        args.preview = True
+    p.add_argument("--nanoowl-timeout", type=float, default=45.0,
+                   help="Timeout (sec) for NanoOWL POST")
+    p.add_argument("--nanoowl-annotate", type=int, default=0,
+                   help="Pass annotate=0/1 to NanoOWL")
 
-    out_dir = datetime.datetime.now().strftime("%Y_%m_%d___%H_%M_%S")
-    args.out = os.path.join(args.out, out_dir)
-    os.makedirs(args.out, exist_ok=True)
+    
+    p.add_argument("--forward-json-url", default="http://172.17.16.9:9090/ingest",
+                   help="If set, forward the FULL sidecar JSON here, but only when NanoOWL has BBOX detections")
+    p.add_argument("--forward-json-timeout", type=float, default=8.0,
+                   help="Timeout (sec) for forwarding full JSON")
+    p.add_argument("--forward-json-retries", type=int, default=3,
+                   help="Retries for forwarding full JSON")
 
-    cap = open_capture(args.source, args.width, args.height, args.fps, args.fourcc)
+    args = p.parse_args()
 
-    # warmup
-    for _ in range(args.warmup):
-        cap.read()
+    JETSON2_ENDPOINT = args.jetson2_endpoint.strip()
+    CAPTURES_ROOT = args.captures_root.strip()
+    NANOOWL_ENDPOINT = args.nanoowl_endpoint.strip()
 
-    if args.interactive:
-        print("[interactive] preview on. Press SPACE or 'c' to capture, 'q' to quit.")
-        manual_pose = _parse_manual_pose(args.manual_pose)
-        base_stem = pose_to_name(manual_pose)
-        counter = 1
+    FORWARD_TIMEOUT = args.forward_timeout
+    FORWARD_RETRIES = args.forward_retries
+    NANOOWL_TIMEOUT = args.nanoowl_timeout
+    NANOOWL_ANNOTATE = int(args.nanoowl_annotate)
 
-        if args.preview:
-            cv2.namedWindow("preview", cv2.WINDOW_NORMAL)
+    global FORWARD_JSON_URL, FORWARD_JSON_TIMEOUT, FORWARD_JSON_RETRIES
+    FORWARD_JSON_URL = (args.forward_json_url or "").strip()
+    FORWARD_JSON_TIMEOUT = float(args.forward_json_timeout)
+    FORWARD_JSON_RETRIES = int(args.forward_json_retries)
 
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                time.sleep(0.01)
-                continue
+    print(f"[comm_manager] listening on {args.host}:{args.port}")
+    print(f"  jetson2_endpoint = {JETSON2_ENDPOINT}")
+    print(f"  captures_root    = {CAPTURES_ROOT}")
+    print(f"  nanoowl_endpoint = {NANOOWL_ENDPOINT} (annotate={NANOOWL_ANNOTATE})")
 
-            if args.preview:
-                cv2.imshow("preview", frame)
-                key = cv2.waitKey(1) & 0xFF
-            else:
-                key = cv2.waitKey(1) & 0xFF  # still poll, but no window shown
+    app.run(host=args.host, port=args.port)
 
-            if key in (ord('q'), 27):  # q or ESC
-                break
-
-            if key in (ord('c'), ord('C'), 32):  # 'c' or SPACE
-                # build filenames (optionally with suffix)
-               # timestamp = datetime.datetime.now().strftime("%Y_%m_%d___%H_%M_%S")
-               # base_path = os.path.join(args.out, f"{base_stem}___{timestamp}")
-               # jpg_path, json_path = (base_path + ".jpg", base_path + ".json")
-                base_path = os.path.join(args.out, base_stem)
-                jpg_path, json_path = (base_path + ".jpg", base_path + ".json")
-                if args.suffix:
-                    jpg_path, json_path = _unique_name(base_path, True, counter)
-                    counter += 1
-
-                # ensure color
-                if len(frame.shape) == 2:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
-                if not cv2.imwrite(jpg_path, frame):
-                    print(f"[capture] ERROR: failed to write {jpg_path}")
-                    continue
-
-                # sidecar & VLM
-                _update_sidecar_json(json_path, manual_pose, os.path.basename(jpg_path), vlm_text=None)
-
-                vlm_caption = None
-                if args.vlm:
-                    img_for_vlm = _remap_path(jpg_path,
-                                              args.vlm_path_src or None,
-                                              args.vlm_path_dst or None)
-                    print(f"[vlm] POST {args.vlm}  image_path={img_for_vlm}")
-                    vlm_caption = _call_vlm(args.vlm, img_for_vlm, args.vlm_timeout, args.vlm_retries)
-                    if vlm_caption:
-                        print(f"[vlm] caption: {vlm_caption[:120]}{'…' if len(vlm_caption)>120 else ''}")
-                    else:
-                        print("[vlm] WARN: no caption returned")
-                    _update_sidecar_json(json_path, manual_pose, os.path.basename(jpg_path), vlm_text=vlm_caption)
-
-                print(f"[capture] saved {jpg_path}")
-
-        if args.preview:
-            cv2.destroyAllWindows()
-
-    else:
-        # Pose-list mode (original behavior)
-        with open(args.poses, "r") as f:
-            poses = json.load(f)
-        if not isinstance(poses, list) or not poses:
-            raise ValueError("poses.json must be a non-empty list of {x,y,z,yaw}")
-
-        for i, pose in enumerate(poses, 1):
-            fname = pose_to_name(pose)
-            jpg_path = os.path.join(args.out, f"{fname}.jpg")
-            json_path = os.path.join(args.out, f"{fname}.json")
-
-            print(f"[capture] {i}/{len(poses)} → {jpg_path}")
-            time.sleep(args.sleep)
-
-            ok, frame = False, None
-            for _ in range(args.retry):
-                ok, frame = cap.read()
-                if ok and frame is not None:
-                    break
-                time.sleep(0.05)
-            if not ok or frame is None:
-                print(f"[capture] WARN: failed to read frame for pose {i}")
-                continue
-
-            if len(frame.shape) == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
-            if not cv2.imwrite(jpg_path, frame):
-                print(f"[capture] ERROR: failed to write {jpg_path}")
-                continue
-
-            _update_sidecar_json(json_path, pose, os.path.basename(jpg_path), vlm_text=None)
-
-            if args.vlm:
-                img_for_vlm = _remap_path(jpg_path,
-                                          args.vlm_path_src or None,
-                                          args.vlm_path_dst or None)
-                print(f"[vlm] POST {args.vlm}  image_path={img_for_vlm}")
-                vlm_caption = _call_vlm(args.vlm, img_for_vlm, args.vlm_timeout, args.vlm_retries)
-                if vlm_caption:
-                    print(f"[vlm] caption: {vlm_caption[:120]}{'…' if len(vlm_caption)>120 else ''}")
-                else:
-                    print("[vlm] WARN: no caption returned")
-                _update_sidecar_json(json_path, pose, os.path.basename(jpg_path), vlm_text=vlm_caption)
-
-    cap.release()
-    print("[capture] done.")
 
 if __name__ == "__main__":
     main()
