@@ -9,7 +9,7 @@ jetson-containers run -it   --publish 8080:8080   --volume /home/user/jetson-con
 
 Then start the API server:
 ```bash
-python3 -m nano_llm.chat   --api=mlc   --model Efficient-Large-Model/VILA1.5-3b   --max-context-len 256   --max-new-tokens 32   --save-json-by-image   --server --port 8080
+python3 -m nano_llm.chat   --api=mlc   --model Efficient-Large-Model/VILA1.5-3b   --max-context-len 256   --max-new-tokens 32   --save-json-by-image   --server --port 8080 --notify-url http://172.16.17.12:5050/from_vila
 ```
 ### 2. **NanoOWL Object Detector**
 
