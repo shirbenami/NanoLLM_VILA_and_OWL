@@ -1,10 +1,229 @@
-# NanoLLM
-<a href="https://www.jetson-ai-lab.com"><img align="right" width="200" height="200" src="https://nvidia-ai-iot.github.io/jetson-generative-ai-playground/images/JON_Gen-AI-panels.png"></a>
+# **System Overview – VILA + Jetson LLM + NanoOWL Integrated Pipeline**
 
-Optimized local inference for LLMs with HuggingFace-like APIs for quantization, vision/language models, multimodal agents, speech, vector DB, and RAG.
+```
+📷 Camera / Stream (/dev/video0)
+       │
+       ▼
+🧩 capture_frames.py → /opt/missions/poses.json
+       │
+       │ Sends image_path requests to
+       ▼
+🧠 VILA API Server (main_with_time_and_json_and_image_http.py)
+(run from: /opt/NanoLLM/nano_llm/chat/__main__.py)
+       │
+       │ Generates textual description for each image
+       ▼
+🌈 display_server.py (Web GUI Viewer)
+Displays live image grid from /home/user/jetson-containers/data/images/captures/
+       └── http://<DEVICE_IP>:8090  ← Live dashboard for images + captions
+       │
+       │ Sends captions to
+       ▼
+🖥️ comm_manager.py 
+       │
+       │ Forwards description to LLM on Jetson #2 → extracts object list
+       ▼
+🤖 NanoOWL (Object Detection Engine)
+       │
+       │ Receives the image + object list → returns bounding boxes
+       ▼
+🎨 Automatic OpenCV Annotator
+       │
+       └── Saves <basename>_ann.jpg next to each original image
+             (with BBOX and labels)
+```
 
-> [!NOTE]  
-> See [`dusty-nv.github.io/NanoLLM`](https://dusty-nv.github.io/NanoLLM) for docs and [**Jetson AI Lab**](https://www.jetson-ai-lab.com/tutorial_nano-llm.html) for tutorials.
+This creates a **real-time, closed-loop multimodal system** connecting:
+**camera capture → vision-language description → object extraction → bounding-box detection → annotated visualization**.
 
-Latest Release:  [24.7](https://dusty-nv.github.io/NanoLLM/releases.html)  ([`dustynv/nano_llm:24.7-r36.2.0`](https://hub.docker.com/r/dustynv/nano_llm/tags)) <br/> 
+---
 
+## 🔹 **Pipeline Stages**
+first- get in to the jetson:
+```
+ssh -X user@172.16.17.12
+```
+
+### 1. `capture_frames.py`
+
+**Purpose:**
+Captures frames from a live video source (e.g., `/dev/video0`) or predefined pose list, saves each image to  
+`/home/user/jetson-containers/data/images/captures/<timestamp>/`,  
+and automatically sends them to the VILA API for caption generation.
+
+Each image is paired with a `.json` metadata file containing:
+- 3D pose (`x`, `y`, `z`, `yaw`)
+- timestamp
+- VILA caption (`vlm_caption`)
+
+**How to Run:**
+```bash
+cd /home/user/jetson-containers/data/images
+python3 capture_frames.py   --source /dev/video0   --vlm http://172.16.17.12:8080/describe
+```
+
+**Output Example:**
+```
+captures/
+  2025_10_15___13_32_41/
+    x0100y0173z0500yaw1047198.jpg
+    x0100y0173z0500yaw1047198.json
+```
+
+---
+
+### 2. **VILA API Server**
+
+**Path:** `/opt/NanoLLM/nano_llm/chat/__main__.py`
+
+**Purpose:**
+The **VILA (Vision-Language Model)** processes each image and generates a **natural language caption** describing the visible objects and context.
+
+**Run inside the VILA container:**
+```bash
+jetson-containers run -it   --publish 8080:8080   --volume /home/user/jetson-containers/data:/mnt/VLM/jetson-data   nano_llm_custom /bin/bash
+```
+
+Then start the API server:
+```bash
+python3 -m nano_llm.chat   --api=mlc   --model Efficient-Large-Model/VILA1.5-3b   --max-context-len 256   --max-new-tokens 32   --save-json-by-image   --server --port 8080 --notify-url http://172.16.17.12:5050/from_vila
+```
+
+**Test Example:**
+```bash
+curl -X POST http://172.16.17.12:8080/describe   -H "Content-Type: application/json"   -d '{"image_path": "/data/images/01.jpg"}'
+```
+
+---
+
+### 3. **Display Server (Web GUI Viewer)**
+
+**Purpose:**
+Provides a live web dashboard for browsing captured images, captions, and metadata.
+
+**Run:**
+```bash
+python3 display_server.py   --root /home/user/jetson-containers/data/images/captures   --host 0.0.0.0   --port 8090   --latest-only
+```
+
+**Open in browser:**
+```
+http://<DEVICE_IP>:8090
+```
+
+This dashboard auto-refreshes every 2 seconds and allows manual reloads for instant dataset inspection.
+
+---
+
+### 4. **comm_manager.py**
+
+**Purpose:**
+Coordinates data between the VILA model, the secondary LLM (Jetson #2), and the NanoOWL engine.
+
+#### 🧭 Flow
+1. **Receives caption** from VILA (`/from_vila`)
+2. **Sends caption** to the **LLM on Jetson #2** (`http://172.16.17.11:5050/prompts`)
+3. **Gets back** a list of object prompts (`["a gun", "a chair", "a desk"]`)
+4. **Finds** the most recent image under `/home/user/jetson-containers/data/images/captures/`
+5. **Sends** the image + prompts to **NanoOWL** (`http://172.16.17.12:5060/infer`)
+6. **NanoOWL** returns bounding boxes of detected objects
+7. **comm_manager** saves these detections into the image JSON under `"nanoowl"`
+8. **OpenCV annotator** automatically draws BBoxes and labels, saving  
+   `<basename>_ann.jpg` next to the original image
+
+**Run:**
+```bash
+python3 comm_manager.py   --host 0.0.0.0   --port 5050   --jetson2-endpoint http://172.16.17.11:5050/prompts   --captures-root /home/user/jetson-containers/data/images/captures   --nanoowl-endpoint http://172.16.17.12:5060/infer   --forward-timeout 25   --forward-retries 5   --nanoowl-timeout 60   --nanoowl-annotate 0
+```
+
+---
+
+### 5. **LLM (Jetson #2)**
+
+**Purpose:**
+Extracts a list of **object keywords** from the textual description generated by VILA.
+
+**Example request:**
+```bash
+curl -X POST http://172.16.17.11:5050/prompts   -H "Content-Type: application/json"   -d '{"sentence":"two black suitcases with red and white labels on the ground"}'
+```
+
+**Example response:**
+```json
+{"prompts":["a suitcase","a red label","a white label"]}
+```
+
+These prompts are automatically forwarded to NanoOWL.
+
+---
+
+### 6. **NanoOWL Object Detector**
+
+**Purpose:**
+Detects objects in the image using the object names (prompts) extracted by the Jetson LLM.
+
+**Example internal call (automated by comm_manager):**
+```bash
+curl -s -X POST http://172.16.17.12:5060/infer   -F 'image=@/home/user/jetson-containers/data/images/captures/x0100y0173z0500yaw1047198.jpg'   -F 'prompts=["a gun","a chair","a desk"]'   -F 'annotate=0'
+```
+
+**NanoOWL Output (stored in JSON):**
+```json
+"nanoowl": {
+  "prompts": ["a gun","a chair","a desk"],
+  "result": {
+    "detections": [
+      {"label": "a gun", "score": 0.98, "bbox": [235, 115, 342, 220]},
+      {"label": "a chair", "score": 0.92, "bbox": [100, 300, 260, 480]}
+    ]
+  }
+}
+```
+
+---
+
+### 7. **Automatic OpenCV Annotator**
+
+After NanoOWL results are written into the `.json`,  
+`comm_manager.py` automatically generates an **annotated image**:
+
+```
+x0100y0173z0500yaw1047198__2025_10_15___13_32_41_ann.jpg
+```
+
+**Annotation Rules:**
+- Draws bounding boxes per object  
+- Uses a deterministic color per label  
+- Writes label text + confidence score  
+- Prevents repeated `_ann_ann` filenames  
+- Skips already-annotated images  
+
+---
+
+## ⚙️ **Final Data Flow Summary**
+
+| Step | Component | Input | Output | Description |
+|------|------------|--------|---------|-------------|
+| 1 | `capture_frames.py` | Camera | `.jpg` + `.json` | Captures and saves raw frames |
+| 2 | `VILA` | image_path | Caption text | Describes objects and context |
+| 3 | `comm_manager.py` | Caption | Object list | Sends caption to LLM Jetson2 |
+| 4 | `LLM Jetson2` | Caption | `["a gun", "a chair", ...]` | Extracts object keywords |
+| 5 | `NanoOWL` | Image + Prompts | BBoxes | Detects objects from the prompts |
+| 6 | `comm_manager.py` | NanoOWL result | `_ann.jpg` | Saves and draws annotated image |
+| 7 | `display_server.py` | Captures folder | Web UI | Displays all images and annotations |
+
+---
+
+## 🧩 **Example Visualization**
+
+Before → After annotation:
+
+```
+📷 Original:
+x0100y0173z0500yaw1047198__2025_10_15___13_32_41.jpg
+
+🎨 Annotated:
+x0100y0173z0500yaw1047198__2025_10_15___13_32_41_ann.jpg
+```
+
+The annotated image now includes bounding boxes and labels for each detected object — fully automated, updated in the live web dashboard.
